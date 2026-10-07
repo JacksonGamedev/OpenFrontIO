@@ -1,0 +1,5 @@
+# Match the toolchain used by the Dockerfile and CI (Node 24 + npm 12.1.0),
+# which package.json's engines field requires (engine-strict is on in .npmrc).
+[build.environment]
+  NODE_VERSION = "24"
+  NPM_VERSION = "12.1.0"
