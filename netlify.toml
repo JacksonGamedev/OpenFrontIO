@@ -1,0 +1,5 @@
+[build.environment]
+  # Match the toolchain used by CI and the Dockerfile: package.json requires npm >=12.1.0 <13
+  # and .npmrc sets engine-strict=true.
+  NODE_VERSION = "24"
+  NPM_VERSION = "12.1.0"
