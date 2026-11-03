@@ -1,0 +1,4 @@
+[build.environment]
+  # package.json "engines" requires npm >=12.1.0 <13 (engine-strict is set in .npmrc),
+  # but the Node 24 image ships npm 11. Match the version pinned in the Dockerfile.
+  NPM_VERSION = "12.1.0"
