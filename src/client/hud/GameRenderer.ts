@@ -15,6 +15,9 @@ import { migrateLegacyGraphicsSettings } from "../GraphicsPresets";
 import { MapRenderer } from "../render/gl";
 import { TransformHandler } from "../TransformHandler";
 import { UIState } from "../UIState";
+// The homepage loads it on demand, but the in-game instance (#game-settings)
+// is set up below, so it has to be defined by the time a game renders.
+import "../UserSettingModal";
 import type { UserSettingModal } from "../UserSettingModal";
 import { UserSettings } from "../UserSettings";
 import { GameView } from "../view";
@@ -36,6 +39,7 @@ import { InGamePromo } from "./layers/InGamePromo";
 import { MainRadialMenu } from "./layers/MainRadialMenu";
 import { MultiTabModal } from "./layers/MultiTabModal";
 import { NewLobbyPrompt } from "./layers/NewLobbyPrompt";
+import { OnboardingOverlay } from "./layers/OnboardingOverlay";
 import { PerformanceOverlay } from "./layers/PerformanceOverlay";
 import { PlayerInfoOverlay } from "./layers/PlayerInfoOverlay";
 import { PlayerPanel } from "./layers/PlayerPanel";
@@ -54,6 +58,7 @@ export function createRenderer(
   playerRole: string | null,
   view: MapRenderer,
   mapLayerController?: MapLayerController,
+  visibleAt?: number,
 ): GameRenderer {
   const transformHandler = new TransformHandler(game, eventBus, inputEl);
   const userSettings = new UserSettings();
@@ -192,6 +197,10 @@ export function createRenderer(
     console.error("settings modal not found");
   }
   settingsModal.eventBus = eventBus;
+  settingsModal.gameConfig = game.config().gameConfig();
+  settingsModal.mapNationCount = game.mapNationCount();
+  settingsModal.game = game;
+  settingsModal.visibleAt = visibleAt;
 
   // The in-game settings instance needs the bus so the Audio sliders reach
   // SoundManager, which caches its volumes at construction, and UIState so the
@@ -235,6 +244,7 @@ export function createRenderer(
     console.error("player panel not found");
   }
   playerPanel.g = game;
+  playerPanel.transformHandler = transformHandler;
   playerPanel.initEventBus(eventBus);
   playerPanel.emojiTable = emojiTable;
   playerPanel.uiState = uiState;
@@ -246,6 +256,7 @@ export function createRenderer(
     console.error("chat modal not found");
   }
   chatModal.g = game;
+  chatModal.transformHandler = transformHandler;
   chatModal.initEventBus(eventBus);
 
   const multiTabModal = document.querySelector(
@@ -313,6 +324,17 @@ export function createRenderer(
   tutorialPanel.userSettings = userSettings;
   tutorialPanel.uiState = uiState;
 
+  const onboardingOverlay = document.querySelector(
+    "onboarding-overlay",
+  ) as OnboardingOverlay;
+  if (!(onboardingOverlay instanceof OnboardingOverlay)) {
+    console.error("onboarding overlay not found");
+  }
+  onboardingOverlay.game = game;
+  onboardingOverlay.eventBus = eventBus;
+  onboardingOverlay.transformHandler = transformHandler;
+  onboardingOverlay.uiState = uiState;
+
   const layers: Controller[] = [
     new WarshipSelectionController(game, eventBus, transformHandler, view),
     new BuildPreviewController(
@@ -361,6 +383,7 @@ export function createRenderer(
     multiTabModal,
     inGamePromo,
     tutorialPanel,
+    onboardingOverlay,
     alertFrame,
     performanceOverlay,
   ];
@@ -383,6 +406,12 @@ export class GameRenderer {
     private performanceOverlay: PerformanceOverlay,
   ) {}
 
+  private canvasSizeObserver: ResizeObserver | null = null;
+
+  private onResize = () => {
+    this.transformHandler.updateCanvasBoundingRect();
+  };
+
   initialize() {
     loadAllSprites().catch((err) =>
       console.warn("Failed to preload sprites:", err),
@@ -390,12 +419,17 @@ export class GameRenderer {
 
     this.layers.forEach((l) => l.init?.());
 
-    window.addEventListener("resize", () =>
-      this.transformHandler.updateCanvasBoundingRect(),
-    );
+    window.addEventListener("resize", this.onResize);
+    this.canvasSizeObserver = this.transformHandler.observeCanvasSize();
 
     //show whole map on startup
     this.transformHandler.centerAll(0.9);
+  }
+
+  dispose() {
+    window.removeEventListener("resize", this.onResize);
+    this.canvasSizeObserver?.disconnect();
+    this.canvasSizeObserver = null;
   }
 
   tick() {

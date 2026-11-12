@@ -15,6 +15,7 @@ import "../../../src/client/hud/layers/PlayerInfoOverlay";
 import type { PlayerInfoOverlay } from "../../../src/client/hud/layers/PlayerInfoOverlay";
 import "../../../src/client/hud/layers/PlayerStats";
 import type { PlayerStats } from "../../../src/client/hud/layers/PlayerStats";
+import { getPlayerIcons } from "../../../src/client/hud/PlayerIcons";
 import type { UnitState } from "../../../src/client/render/types";
 import type { ReplayReader } from "../../../src/client/replay/codec/decode/ReplayReader";
 import type { ReplayFrame } from "../../../src/client/replay/codec/ReplayTypes";
@@ -366,6 +367,44 @@ describe("ReplayGameAdapter", () => {
     }
   }, 30_000);
 
+  test("a nuke at unowned land gets the plain icon while a player is followed", () => {
+    const frame = reader.seek(119);
+    adapter.update(frame, EMPTY, 0, false);
+    const owners = adapter
+      .playerViews()
+      .filter((p) => p.isAlive() && p.numTilesOwned() > 0);
+    const [followed, hovered] = owners;
+    const unowned = [...frame.tileState].findIndex(
+      (t, ref) => ref > 0 && (t & 0xfff) === 0,
+    );
+    const ownedByFollowed = [...frame.tileState].findIndex(
+      (t) => (t & 0xfff) === followed.smallID(),
+    );
+    const nukeIcon = (targetTile: number) => {
+      adapter.update(
+        withUnits(frame, [
+          unit(1, UnitType.AtomBomb, hovered.smallID(), { targetTile }),
+        ]),
+        EMPTY,
+        0,
+        false,
+      );
+      return getPlayerIcons({
+        game: adapter.asGameView(),
+        player: hovered as never,
+        firstPlace: null,
+      }).find((i) => i.id === "nuke");
+    };
+    adapter.focus = followed;
+    try {
+      expect(adapter.owner(unowned).isPlayer()).toBe(false);
+      expect(nukeIcon(unowned)?.src).toContain("NukeIconWhite");
+      expect(nukeIcon(ownedByFollowed)?.src).toContain("NukeIconRed");
+    } finally {
+      adapter.focus = null;
+    }
+  });
+
   test("players follow the latest frame, read when the HUD asks", () => {
     const early = reader.seek(0);
     const late = reader.seek(119);
@@ -437,6 +476,98 @@ describe("ReplayGameAdapter", () => {
     expect(afterSeek[GameUpdateType.DonateEvent]).toEqual([]);
     expect(afterSeek[GameUpdateType.Emoji]).toEqual([{ e: 1 }]);
   });
+
+  test("events the HUD didn't read are dropped when its tick ends", async () => {
+    const frame = reader.seek(119);
+    adapter.update(frame, EMPTY, 0, false, true);
+    const alive = adapter.playerViews().find((p) => p.isAlive())!;
+    const dead = adapter.playerViews().find((p) => !p.isAlive())!;
+    const message = (n: number, playerID: number) =>
+      ({
+        ...frame,
+        miscUpdates: {
+          DisplayEvent: [
+            {
+              messageType: 0,
+              message: `message ${n}`,
+              playerID,
+              gold: undefined,
+              params: {},
+            },
+          ],
+        },
+      }) as never;
+
+    const feed = document.createElement("events-display") as EventsDisplay;
+    feed.game = adapter.asGameView();
+    feed.eventBus = new EventBus();
+    document.body.appendChild(feed);
+    try {
+      feed.init();
+      // Following a dead player, the feed reads nothing for a while.
+      adapter.focus = dead;
+      for (let n = 0; n < 3; n++) {
+        adapter.update(message(n, alive.smallID()), EMPTY, 0, false);
+        feed.tick();
+        adapter.endHudTick();
+      }
+      // Then a living one: only what's new shows, not the backlog.
+      adapter.focus = alive;
+      adapter.update(message(3, alive.smallID()), EMPTY, 0, false);
+      feed.tick();
+      await feed.updateComplete;
+      const text = feed.textContent ?? "";
+      expect(text).toContain("message 3");
+      expect(text).not.toContain("message 0");
+      expect(text).not.toContain("message 2");
+    } finally {
+      feed.remove();
+    }
+  }, 30_000);
+
+  test("a backward seek clears later events from the feed", async () => {
+    const late = reader.seek(119);
+    adapter.update(late, EMPTY, 0, false, true);
+    const alive = adapter.playerViews().find((p) => p.isAlive())!;
+    adapter.focus = alive;
+    const feed = document.createElement("events-display") as EventsDisplay;
+    feed.game = adapter.asGameView();
+    feed.eventBus = new EventBus();
+    document.body.appendChild(feed);
+    try {
+      feed.init();
+      adapter.update(
+        {
+          ...late,
+          miscUpdates: {
+            DisplayEvent: [
+              {
+                messageType: 0,
+                message: "from later on",
+                playerID: alive.smallID(),
+                gold: undefined,
+                params: {},
+              },
+            ],
+          },
+        } as never,
+        EMPTY,
+        0,
+        false,
+      );
+      feed.tick();
+      await feed.updateComplete;
+      expect(feed.textContent ?? "").toContain("from later on");
+
+      // Back to a point before that message was sent.
+      adapter.update(reader.seek(100), EMPTY, 0, false, true);
+      feed.tick();
+      await feed.updateComplete;
+      expect(feed.textContent ?? "").not.toContain("from later on");
+    } finally {
+      feed.remove();
+    }
+  }, 30_000);
 
   test("the game's own event feed renders for the followed player", async () => {
     const frame = reader.seek(119);

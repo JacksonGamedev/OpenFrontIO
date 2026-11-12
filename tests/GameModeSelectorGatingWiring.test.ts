@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { GameMapType, GameMode } from "@openfront/engine-api/game/GameTypes";
 import type { GameConfig } from "@openfront/engine-api/Schemas";
 import type {
@@ -27,6 +28,12 @@ vi.mock("../src/client/LobbySocket", () => ({
     start(): void {}
     stop(): void {}
   },
+}));
+
+// The lobby modals load on demand; the stubs below stand in for loaded ones.
+vi.mock("../src/client/LazyModals", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/client/LazyModals")>()),
+  whenModalLoaded: (_tag: string, open: () => void) => open(),
 }));
 
 // Registers <game-mode-selector> as a side effect.
@@ -388,14 +395,22 @@ describe("grid placement", () => {
 
   it("keeps the upcoming column beside the spinner while loading", () => {
     expect(heroSlot()).not.toBeNull();
+    const spinner = heroSlot()!.querySelector('div[role="status"]');
+    expect(spinner).not.toBeNull();
+    expect(spinner!.className).toContain("h-44 sm:h-full");
     expect(section().className).toContain("sm:col-start-2");
     expect(section().className).not.toContain("sm:col-span-2");
   });
 
-  it("drops the hero slot and spans the row when there is no FFA lobby", async () => {
+  it("renders a static placeholder without role=status when loaded without an FFA lobby", async () => {
     await pushLobbies({ team: [publicLobby("team-1")] });
-    expect(heroSlot()).toBeNull();
-    expect(section().className).toContain("sm:col-start-1 sm:col-span-2");
+    expect(heroSlot()).not.toBeNull();
+    expect(heroSlot()!.querySelector('div[role="status"]')).toBeNull();
+    const placeholder = heroSlot()!.querySelector("div.rounded-2xl.bg-surface");
+    expect(placeholder).not.toBeNull();
+    expect(placeholder!.className).toContain("h-44 sm:h-full");
+    expect(section().className).toContain("sm:col-start-2");
+    expect(section().className).not.toContain("sm:col-span-2");
   });
 
   it("lets a lone card take both card rows", async () => {

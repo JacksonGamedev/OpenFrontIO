@@ -30,13 +30,8 @@ export class HeadsUpMessage extends LitElement implements Controller {
   private isImmunityActive = false;
 
   @state()
-  private isCatchingUp = false;
-  private catchingUpTicks = 0;
-
-  @state()
   private isOvertimeNotice = false;
 
-  private static readonly CATCHING_UP_SHOW_THRESHOLD = 10;
   // How long the overtime announcement banner stays up after the start minute.
   private static readonly OVERTIME_NOTICE_SECONDS = 5;
 
@@ -163,18 +158,6 @@ export class HeadsUpMessage extends LitElement implements Controller {
       this.game.isSpawnImmunityActive() &&
       ticksSinceSpawnEnd < showImmunityHudDuration;
 
-    const currentlyCatchingUp =
-      !this.game.config().isReplay() && this.game.isCatchingUp();
-
-    if (currentlyCatchingUp) {
-      this.catchingUpTicks++;
-    } else {
-      this.catchingUpTicks = 0;
-    }
-
-    this.isCatchingUp =
-      this.catchingUpTicks >= HeadsUpMessage.CATCHING_UP_SHOW_THRESHOLD;
-
     // Announce overtime in this banner (not the toast, which is a brief
     // notification slot). Window-based rather than a fired-once flag, so a
     // late joiner or replay seek doesn't get a stale announcement long after
@@ -188,19 +171,17 @@ export class HeadsUpMessage extends LitElement implements Controller {
       elapsed >= overtimeStart &&
       elapsed < overtimeStart + HeadsUpMessage.OVERTIME_NOTICE_SECONDS;
 
+    // The onboarding tutorial's own card says where to spawn.
     this.isVisible =
-      this.game.inSpawnPhase() ||
+      (this.game.inSpawnPhase() &&
+        this.game.config().gameConfig().tutorial !== true) ||
       this.isPaused ||
       this.isImmunityActive ||
-      this.isCatchingUp ||
       this.isOvertimeNotice;
     this.requestUpdate();
   }
 
   private getMessage(): string {
-    if (this.isCatchingUp) {
-      return translateText("heads_up_message.catching_up");
-    }
     if (this.isPaused) {
       if (this.game.config().gameConfig().gameType === GameType.Singleplayer) {
         return translateText("heads_up_message.singleplayer_game_paused");
@@ -238,94 +219,111 @@ export class HeadsUpMessage extends LitElement implements Controller {
   render() {
     return html`
       <div style="pointer-events: none;">
-        ${this.toastMessage
-          ? html`
-              <div
-                data-game-toast
-                data-game-input-pass-through
-                class="fixed top-6 left-1/2 -translate-x-1/2 z-[1002]
+        ${
+          this.toastMessage
+            ? html`
+                <div
+                  data-game-toast
+                  data-game-input-pass-through
+                  class="fixed top-6 left-1/2 -translate-x-1/2 z-[1002]
                        max-w-[90vw] pointer-events-auto touch-none select-none
                        cursor-grab active:cursor-grabbing"
-                @pointerdown=${this.onToastPointerDown}
-                @pointermove=${this.onToastPointerMove}
-                @pointerup=${this.onToastPointerUp}
-                @pointercancel=${this.onToastPointerCancel}
-                @contextmenu=${(e: MouseEvent) => e.preventDefault()}
-              >
-                <div
-                  data-game-toast-content
-                  class="px-6 py-4 rounded-xl animate-fade-in-out"
-                  style="min-width: 200px; text-align: center;
-                  transform: translate3d(${this.toastDragOffset.x}px, ${this
-                    .toastDragOffset.y}px, 0);
-                  transition: ${this.toastPointerId === null
-                    ? "transform 180ms cubic-bezier(0.4, 0, 0.2, 1)"
-                    : "none"};
-                  background: ${this.toastColor === "red"
-                    ? "rgba(239,68,68,0.1)"
-                    : "rgba(34,197,94,0.1)"};
-                  border: 1px solid ${this.toastColor === "red"
-                    ? "rgba(239,68,68,0.5)"
-                    : "rgba(34,197,94,0.5)"};
-                  color: white;
-                  box-shadow: 0 0 30px 0 ${this.toastColor === "red"
-                    ? "rgba(239,68,68,0.3)"
-                    : "rgba(34,197,94,0.3)"};
-                  backdrop-filter: blur(12px);"
+                  @pointerdown=${this.onToastPointerDown}
+                  @pointermove=${this.onToastPointerMove}
+                  @pointerup=${this.onToastPointerUp}
+                  @pointercancel=${this.onToastPointerCancel}
+                  @contextmenu=${(e: MouseEvent) => e.preventDefault()}
                 >
-                  ${typeof this.toastMessage === "string"
-                    ? html`<span class="font-medium"
-                        >${this.toastMessage}</span
-                      >`
-                    : this.toastMessage}
+                  <div
+                    data-game-toast-content
+                    class="px-6 py-4 rounded-xl animate-fade-in-out"
+                    style="min-width: 200px; text-align: center;
+                  transform: translate3d(${this.toastDragOffset.x}px, ${
+                      this.toastDragOffset.y
+                    }px, 0);
+                  transition: ${
+                      this.toastPointerId === null
+                        ? "transform 180ms cubic-bezier(0.4, 0, 0.2, 1)"
+                        : "none"
+                    };
+                  background: ${
+                      this.toastColor === "red"
+                        ? "rgba(239,68,68,0.1)"
+                        : "rgba(34,197,94,0.1)"
+                    };
+                  border: 1px solid ${
+                      this.toastColor === "red"
+                        ? "rgba(239,68,68,0.5)"
+                        : "rgba(34,197,94,0.5)"
+                    };
+                  color: white;
+                  box-shadow: 0 0 30px 0 ${
+                      this.toastColor === "red"
+                        ? "rgba(239,68,68,0.3)"
+                        : "rgba(34,197,94,0.3)"
+                    };
+                  backdrop-filter: blur(12px);"
+                  >
+                    ${
+                      typeof this.toastMessage === "string"
+                        ? html`<span class="font-medium"
+                            >${this.toastMessage}</span
+                          >`
+                        : this.toastMessage
+                    }
+                  </div>
                 </div>
-              </div>
-            `
-          : null}
-        ${this.isVisible
-          ? html`
-              <div
-                class="fixed top-[15%] left-1/2 -translate-x-1/2 z-[799]
+              `
+            : null
+        }
+        ${
+          this.isVisible
+            ? html`
+                <div
+                  class="fixed top-[15%] left-1/2 -translate-x-1/2 z-[799]
                             inline-flex items-center justify-center min-h-8 lg:min-h-10
                             w-fit max-w-[90vw]
                             bg-gray-800/70 rounded-md lg:rounded-lg
                             backdrop-blur-xs text-white text-md lg:text-xl px-3 lg:px-4 py-1
                             text-center break-words"
-                style="word-wrap: break-word; hyphens: auto;"
-                @contextmenu=${(e: MouseEvent) => e.preventDefault()}
-              >
-                ${this.getMessage()}
-              </div>
-            `
-          : null}
-        ${this.game?.inSpawnPhase() &&
-        !this.game.config().isReplay() &&
-        !this.game.config().isIntentionalSpectator() &&
-        this.game.config().gameConfig().rankedType !== RankedType.OneVOne &&
-        this.game.config().gameConfig().gameMode === GameMode.FFA &&
-        this.game.config().gameConfig().gameType === GameType.Public &&
-        !this.hasClosedCollusionWarning
-          ? html`
-              <div
-                class="fixed top-[25%] left-1/2 -translate-x-1/2 z-[799]
+                  style="word-wrap: break-word; hyphens: auto;"
+                  @contextmenu=${(e: MouseEvent) => e.preventDefault()}
+                >
+                  ${this.getMessage()}
+                </div>
+              `
+            : null
+        }
+        ${
+          this.game?.inSpawnPhase() &&
+          !this.game.config().isReplay() &&
+          !this.game.config().isIntentionalSpectator() &&
+          this.game.config().gameConfig().rankedType !== RankedType.OneVOne &&
+          this.game.config().gameConfig().gameMode === GameMode.FFA &&
+          this.game.config().gameConfig().gameType === GameType.Public &&
+          !this.hasClosedCollusionWarning
+            ? html`
+                <div
+                  class="fixed top-[25%] left-1/2 -translate-x-1/2 z-[799]
                             inline-flex flex-col items-center justify-center min-h-8 lg:min-h-10
                             w-fit max-w-[90vw]
                             bg-amber-500/70 rounded-md lg:rounded-lg
                             backdrop-blur-xs text-white text-md lg:text-xl px-3 lg:px-4 py-3
                             text-center break-words"
-                style="word-wrap: break-word; hyphens: auto; pointer-events: auto;"
-                @contextmenu=${(e: MouseEvent) => e.preventDefault()}
-              >
-                <div>${translateText("heads_up_message.ffa_collusion")}</div>
-                <button
-                  class="mt-2 px-3 py-1 rounded bg-black/20 hover:bg-black/30 text-sm"
-                  @click=${this.onCloseCollusionWarning}
+                  style="word-wrap: break-word; hyphens: auto; pointer-events: auto;"
+                  @contextmenu=${(e: MouseEvent) => e.preventDefault()}
                 >
-                  ${translateText("heads_up_message.dont_show_again")}
-                </button>
-              </div>
-            `
-          : null}
+                  <div>${translateText("heads_up_message.ffa_collusion")}</div>
+                  <button
+                    class="mt-2 px-3 py-1 rounded bg-black/20 hover:bg-black/30 text-sm"
+                    @click=${this.onCloseCollusionWarning}
+                  >
+                    ${translateText("heads_up_message.dont_show_again")}
+                  </button>
+                </div>
+              `
+            : null
+        }
       </div>
     `;
   }

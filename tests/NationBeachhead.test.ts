@@ -7,10 +7,10 @@ import {
 import { PseudoRandom } from "@openfront/engine-lib/PseudoRandom";
 import { AttackExecution } from "@openfront/engine/execution/AttackExecution";
 import { NationAllianceBehavior } from "@openfront/engine/execution/nation/NationAllianceBehavior";
+import { NationAttackBehavior } from "@openfront/engine/execution/nation/NationAttackBehavior";
 import { NationEmojiBehavior } from "@openfront/engine/execution/nation/NationEmojiBehavior";
 import { NationWarshipBehavior } from "@openfront/engine/execution/nation/NationWarshipBehavior";
 import { TransportShipExecution } from "@openfront/engine/execution/TransportShipExecution";
-import { AiAttackBehavior } from "@openfront/engine/execution/utils/AiAttackBehavior";
 import { createGame, L, W } from "./core/pathfinding/_fixtures";
 import { setup } from "./util/Setup";
 
@@ -36,7 +36,7 @@ describe("Nation beachhead boats", () => {
     island.setTroops(10_000);
     const random = new PseudoRandom(42);
     const emoji = new NationEmojiBehavior(random, game, nation);
-    const behavior = new AiAttackBehavior(
+    const behavior = new NationAttackBehavior(
       random,
       game,
       nation,
@@ -171,8 +171,8 @@ describe("Nation beachhead boats", () => {
 // Our land at x <= 4, a 4-tile strait, unowned land at x >= 9
 describe("Nation beachheads on unowned land", () => {
   it.each([
-    [Difficulty.Hard, 1_000],
-    [Difficulty.Medium, 20_000],
+    [Difficulty.Hard, 800],
+    [Difficulty.Medium, 16_000],
   ])("%s boats %i troops across the strait", (difficulty, troops) => {
     const width = 16;
     const height = 8;
@@ -188,10 +188,11 @@ describe("Nation beachheads on unowned land", () => {
     game.map().forEachTile((tile) => {
       if (game.map().isLand(tile) && game.x(tile) <= 4) nation.conquer(tile);
     });
-    nation.setTroops(100_000);
+    nation.setTroops(80_000);
+    expect(game.config().maxTroops(nation)).toBeGreaterThan(80_000);
     const random = new PseudoRandom(42);
     const emoji = new NationEmojiBehavior(random, game, nation);
-    const behavior = new AiAttackBehavior(
+    const behavior = new NationAttackBehavior(
       random,
       game,
       nation,

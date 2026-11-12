@@ -18,7 +18,7 @@ vi.mock("../../src/client/Auth", () => ({
   linkSteam: vi.fn(async () => true),
   steamLogin: vi.fn(),
   logOut: vi.fn(async () => true),
-  reauthAfterCrazyGamesChange: vi.fn(async () => false),
+  reauthAfterPortalChange: vi.fn(async () => false),
   sendMagicLink: vi.fn(async () => true),
   getAuthHeader: vi.fn(async () => "Bearer test-token"),
 }));
@@ -69,6 +69,10 @@ function makeUserMe(
 ): UserMeResponse {
   return {
     user: { ...overrides },
+    steamLicence: false,
+    steamLicenceSince: null,
+    noticesSeen: [],
+    pendingMessages: [],
     player: {
       publicId: "test-player",
       adfree: false,
@@ -307,6 +311,7 @@ describe("AccountModal — rendering", () => {
 
     it("captions the provider buttons as continuing in the browser when the bridge is present", async () => {
       (window as unknown as { openfrontDesktop: unknown }).openfrontDesktop = {
+        steam: {},
         showLinkGate: vi.fn(async () => undefined),
       };
       modal.open();
@@ -356,6 +361,7 @@ describe("AccountModal — rendering", () => {
     // not.
     it("keeps the browser captions when the bridge lacks showLinkGate", async () => {
       (window as unknown as { openfrontDesktop: unknown }).openfrontDesktop = {
+        steam: {},
         linkGate: {},
       };
       modal.open();
@@ -372,6 +378,7 @@ describe("AccountModal — rendering", () => {
     // key is a prefix of the desktop one.
     it("captions the Google link button as opening the website on desktop", async () => {
       (window as unknown as { openfrontDesktop: unknown }).openfrontDesktop = {
+        steam: {},
         showLinkGate: vi.fn(async () => undefined),
       };
       await setLoggedInUser(
@@ -481,7 +488,9 @@ describe("AccountModal — rendering", () => {
   it("offers no Steam sign-in or link inside the desktop shell", async () => {
     // A shell player already holds the Steam identity through the native
     // ticket, so both surfaces would be no-ops that look like options.
-    (window as unknown as { openfrontDesktop: unknown }).openfrontDesktop = {};
+    (window as unknown as { openfrontDesktop: unknown }).openfrontDesktop = {
+      steam: {},
+    };
     await setLoggedInUser(
       makeUserMe({
         discord: {

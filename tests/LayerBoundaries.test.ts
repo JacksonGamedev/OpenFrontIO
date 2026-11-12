@@ -8,10 +8,12 @@
  * so the list only shrinks.
  */
 import fs from "fs";
+import { type Node } from "oxc-parser";
+import { transformSync } from "oxc-transform";
 import path from "path";
-import ts from "typescript";
 import { fileURLToPath } from "url";
 import { describe, expect, test } from "vitest";
+import { forEachChild, isStringLiteral, parseSource } from "./util/sourceAst";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -61,6 +63,27 @@ const NETWORK = /\b(fetch|XMLHttpRequest|WebSocket|importScripts)\b/g;
 const INEXACT_MATH =
   /\bMath\.(a?cosh?|a?sinh?|a?tanh?|atan2|cbrt|exp|expm1|hypot|log|log1p|log2|log10|pow)\b/g;
 
+/**
+ * The game client: the homepage loads it only once a game is joining
+ * (src/client/GameClientLoader.ts), and the store's cosmetic previews only
+ * once one opens. Whatever the homepage imports statically is in its first
+ * download.
+ */
+const GAME_CLIENT =
+  /^src\/client\/((hud|view|controllers|render)\/.*|ClientGameRunner|Transport|LocalServer|InputHandler|TransformHandler|WebGLFrameBuilder|WorkerClient)\.ts$/;
+
+/**
+ * The modals the homepage loads on demand: whatever src/client/LazyModals.ts
+ * imports.
+ */
+const LAZY_MODALS = "src/client/LazyModals.ts";
+
+/** Renderer settings the homepage's settings screens read too. */
+const HOMEPAGE_RENDER_SETTINGS = new Set([
+  "src/client/render/gl/GraphicsOverrides.ts",
+  "src/client/render/gl/RenderSettings.ts",
+]);
+
 /** Known violations, as "<from file> -> <to file>"; never add to it. */
 const ALLOWLIST: string[] = [];
 
@@ -96,32 +119,53 @@ function walk(dir: string, out: string[] = []): string[] {
 
 function specifiers(file: string): string[] {
   const text = fs.readFileSync(path.join(ROOT, file), "utf8");
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  const program = parseSource(file, text);
   const out: string[] = [];
-  const visit = (node: ts.Node) => {
+  const visit = (node: Node) => {
     if (
-      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
-      node.moduleSpecifier &&
-      ts.isStringLiteral(node.moduleSpecifier)
+      node.type === "ImportDeclaration" ||
+      node.type === "ExportNamedDeclaration" ||
+      node.type === "ExportAllDeclaration"
     ) {
-      out.push(node.moduleSpecifier.text);
-    } else if (
-      ts.isImportTypeNode(node) &&
-      ts.isLiteralTypeNode(node.argument) &&
-      ts.isStringLiteral(node.argument.literal)
-    ) {
-      out.push(node.argument.literal.text);
-    } else if (
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length > 0 &&
-      ts.isStringLiteralLike(node.arguments[0])
-    ) {
-      out.push(node.arguments[0].text);
+      const source = node.source;
+      if (source !== null && isStringLiteral(source)) {
+        out.push(source.value);
+      }
+    } else if (node.type === "TSImportType") {
+      if (isStringLiteral(node.source)) {
+        out.push(node.source.value);
+      }
+    } else if (node.type === "ImportExpression") {
+      if (isStringLiteral(node.source)) {
+        out.push(node.source.value);
+      }
     }
-    ts.forEachChild(node, visit);
+    forEachChild(node, visit);
   };
-  visit(sf);
+  visit(program);
+  return out;
+}
+
+/**
+ * The imports and re-exports left once the types are erased: an import used
+ * only as a type is erased, so it loads nothing.
+ */
+function runtimeSpecifiers(source: string): string[] {
+  const js = transformSync("input.ts", source, { sourcemap: false }).code;
+  const program = parseSource("out.js", js);
+  const out: string[] = [];
+  for (const statement of program.body) {
+    if (
+      statement.type === "ImportDeclaration" ||
+      statement.type === "ExportNamedDeclaration" ||
+      statement.type === "ExportAllDeclaration"
+    ) {
+      const specifier = statement.source;
+      if (specifier !== null && isStringLiteral(specifier)) {
+        out.push(specifier.value);
+      }
+    }
+  }
   return out;
 }
 
@@ -220,8 +264,50 @@ function violations(): {
   return { edges, determinism, inexactMath, io };
 }
 
+/**
+ * The game client files and on-demand modals the homepage loads up front, each
+ * as the chain of static imports from src/client/Main.ts that reaches it.
+ */
+function homepageOnDemandImports(): string[] {
+  const ENTRY = "src/client/Main.ts";
+  const lazyModals = new Set(
+    [
+      ...fs
+        .readFileSync(path.join(ROOT, LAZY_MODALS), "utf8")
+        .matchAll(/import\("([^"]+)"\)/g),
+    ].flatMap((m) => {
+      const r = resolve(LAZY_MODALS, m[1]);
+      return "npm" in r ? [] : [r.file];
+    }),
+  );
+  const importer = new Map<string, string>([[ENTRY, ""]]);
+  const queue = [ENTRY];
+  const found: string[] = [];
+  while (queue.length > 0) {
+    const file = queue.shift()!;
+    const text = fs.readFileSync(path.join(ROOT, file), "utf8");
+    for (const spec of runtimeSpecifiers(text)) {
+      const r = resolve(file, spec);
+      if ("npm" in r || importer.has(r.file)) continue;
+      importer.set(r.file, file);
+      if (
+        (GAME_CLIENT.test(r.file) && !HOMEPAGE_RENDER_SETTINGS.has(r.file)) ||
+        lazyModals.has(r.file)
+      ) {
+        const chain = [r.file];
+        for (let f = file; f !== ""; f = importer.get(f)!) chain.unshift(f);
+        found.push(chain.join(" -> "));
+      } else if (/\.(ts|js|mjs)$/.test(r.file)) {
+        queue.push(r.file);
+      }
+    }
+  }
+  return found.sort();
+}
+
 describe("layer boundaries", () => {
   const { edges, determinism, inexactMath, io } = violations();
+  const homepageOnDemand = homepageOnDemandImports();
 
   test("no import edges outside the allowed graph", () => {
     const allowed = new Set(ALLOWLIST);
@@ -266,6 +352,25 @@ describe("layer boundaries", () => {
     ]) {
       expect(hits(src), src).toBe(false);
     }
+  });
+
+  test("the homepage loads the game client and its modals only on demand", () => {
+    expect(homepageOnDemand).toEqual([]);
+  });
+
+  test("the homepage check follows only imports that load something", () => {
+    expect(
+      runtimeSpecifiers(`
+        import { a } from "./a";
+        import { B } from "./b";
+        import type { C } from "./c";
+        import { type D } from "./d";
+        import "./e";
+        export { f } from "./f";
+        const x: B | C | D = a;
+        const g = () => import("./g");
+      `),
+    ).toEqual(["./a", "./e", "./f"]);
   });
 
   test("engine code loads nothing over the network", () => {

@@ -89,12 +89,31 @@ export const ColorPaletteSchema = z.object({
   secondaryColor: z.string(),
 });
 
+// A store sale. While one covers an item, the item's priceHard/priceSoft are
+// already the sale price (what the purchase endpoints charge); listPriceHard/
+// listPriceSoft carry the price before it, and `promotion` names the sale.
+export const PromotionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  percentOff: z.number(),
+  // For a flash sale, when the current item's discount ends and the next
+  // item's starts.
+  endsAt: z.string(),
+  // A flash sale discounts one item at a time, the same for every player,
+  // a new one every slot. Absent on a store-wide or scoped sale.
+  kind: z.literal("flash").optional(),
+});
+export type Promotion = z.infer<typeof PromotionSchema>;
+
 const CosmeticSchema = z.object({
   name: CosmeticNameSchema,
   affiliateCode: z.string().nullable().optional(),
   product: ProductSchema.nullable(),
   priceSoft: z.number().optional(),
   priceHard: z.number().optional(),
+  listPriceSoft: z.number().optional(),
+  listPriceHard: z.number().optional(),
+  promotion: PromotionSchema.optional(),
   artist: z.string().optional(),
   // Whether the artist declared they used generative AI making this. Present only when they
   // actually answered: the catalogue omits the field for everything nobody was asked about, so
@@ -486,6 +505,9 @@ export const CosmeticPackSchema = z.object({
   displayName: z.string(),
   description: z.string(),
   priceHard: z.number(),
+  // Present only while a sale covers the pack; priceHard is then the sale price.
+  listPriceHard: z.number().optional(),
+  promotion: PromotionSchema.optional(),
   rarity: z
     .enum(["common", "uncommon", "rare", "epic", "legendary"])
     .or(z.string()),
@@ -497,14 +519,16 @@ export const SubscriptionSchema = CosmeticSchema.extend({
   priceMonthly: z.number(),
   dailySoftCurrency: z.number(),
   dailyHardCurrency: z.number(),
-  // One-time plutonium grant on subscribing (advertised on the store tile).
+  // Plutonium paid at the start of every paid month. Named for when it was
+  // paid once, on subscribing.
   hardCurrencySignupBonus: z.number(),
-  // Whether this tier exempts subscribers from the free-ranked-play limits
-  // (advertised on the store tile).
-  unlimitedRanked: z.boolean(),
+  // Ranked play limits are gone; still sent by the API until a later release.
+  unlimitedRanked: z.boolean().optional(),
   // Whether this tier lets subscribers list custom lobbies publicly
   // (advertised on the store tile).
   canCreatePublicLobbies: z.boolean(),
+  // Only Steam licence holders may buy this tier; the server enforces it.
+  requiresSteamLicence: z.boolean().optional().default(false),
 });
 
 // Schema for resources/cosmetics/cosmetics.json
@@ -538,6 +562,9 @@ export const CosmeticsSchema = z.object({
   // this client doesn't know is dropped alone, not the whole catalog.
   packs: lenientRecord(CosmeticPackSchema).optional(),
   subscriptions: z.record(z.string(), SubscriptionSchema).optional(),
+  // Tiers this rail does not list but a player may hold. Display only: a
+  // player's own tier renders from here, and nothing here is ever for sale.
+  unlistedSubscriptions: z.record(z.string(), SubscriptionSchema).optional(),
   // Custom tribe name pricing (store Tribes tab) — served here so the client
   // never hardcodes it. Optional: an older cosmetics.json parses, and the UI
   // hides boost purchasing when absent.
@@ -551,6 +578,9 @@ export const CosmeticsSchema = z.object({
   // Price to put a listed lobby in the public queue (host modal's Queue
   // button). Optional like tribeNames; the button hides when absent.
   lobbyQueue: z.object({ priceHard: z.number() }).optional(),
+  // Every sale running when the catalog was served, for the store banner.
+  // Optional: an older cosmetics.json has none.
+  promotions: PromotionSchema.array().optional(),
 });
 
 /**

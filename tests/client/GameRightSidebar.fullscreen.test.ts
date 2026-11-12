@@ -21,6 +21,7 @@ function fakeGame(): GameView {
     elapsedGameSeconds: () => 0,
     myPlayer: () => undefined,
     gameID: () => "test-game",
+    resumedFromSave: () => false,
   } as unknown as GameView;
 }
 
@@ -56,7 +57,7 @@ async function flush(el: TestSidebar): Promise<void> {
 function fullscreenButton(el: TestSidebar): HTMLImageElement | undefined {
   const images = [
     ...el.renderRoot.querySelectorAll<HTMLImageElement>("img"),
-  ].filter((img) => img.alt !== "settings" && img.alt !== "exit");
+  ].filter((img) => img.src.includes("Fullscreen"));
   return images[0];
 }
 

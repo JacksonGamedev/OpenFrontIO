@@ -156,12 +156,24 @@ export const RENDERABLE_NAME_HAS_ALNUM_RE = new RegExp(
   "u",
 );
 
+export const MIN_USERNAME_LENGTH = 3;
+export const MAX_USERNAME_LENGTH = 20;
+export const MAX_STORED_USERNAME_LENGTH = 27;
+
 // Requires at least one non-space so a name is never all padding.
+// Wide enough to read names already written into archived game records (replays).
 export const UsernameSchema = z
   .string()
   .regex(new RegExp(`^(?=.*\\S)[${RENDERABLE_NAME_CHARS}]+$`, "u"))
-  .min(3)
-  .max(27);
+  .min(MIN_USERNAME_LENGTH)
+  .max(MAX_STORED_USERNAME_LENGTH);
+
+// Active username schema enforced on live player joins: prevents bypassing the 20-character cap.
+export const JoinUsernameSchema = z
+  .string()
+  .regex(new RegExp(`^(?=.*\\S)[${RENDERABLE_NAME_CHARS}]+$`, "u"))
+  .min(MIN_USERNAME_LENGTH)
+  .max(MAX_USERNAME_LENGTH);
 
 export const ClanTagSchema = z
   .string()
@@ -177,7 +189,7 @@ export const ClanTagSchema = z
 // GameConfig on the wire. The candidate ORDER is the wire layout; only the
 // picking got cheaper.
 const TEAM_COUNT_PRESETS = [Duos, Trios, Quads, HumansVsNations] as const;
-const TeamCountConfigSchema = zb.union(
+export const TeamCountConfigSchema = zb.union(
   [
     zb.uint(),
     z.literal(Duos),
@@ -297,6 +309,9 @@ export const GameConfigSchema = z.object({
   nameRevealPublicIds: z.string().array().max(200).optional(),
   waterNukes: z.boolean().nullable().optional(),
   randomSpawn: z.boolean(),
+  // The onboarding tutorial (docs/OnboardingTutorial.md): nations and tribes
+  // only grow into free land, and the game ends once the human is alone.
+  tutorial: z.boolean().optional(),
   maxPlayers: zb.uint().optional(),
   // OFM: allowlist of publicIds allowed to join (admin-only, see create_game).
   allowedPublicIds: z.array(z.string()).max(200).optional(),
@@ -306,6 +321,9 @@ export const GameConfigSchema = z.object({
   // create_game / update_game_config.
   trusted: z.boolean().optional(),
   maxTimerValue: zb.uint({ min: 1, max: 120 }).nullable().optional(), // In minutes
+  // Tile share needed to win, in tenths of a percent (755 = 75.5%). Capped at
+  // 99.9%: the win check is a strict ">", so 100% could never be won.
+  winThresholdTenths: zb.uint({ min: 100, max: 999 }).nullable().optional(),
   customAllianceDuration: zb.uint({ max: 15 }).nullable().optional(), // In minutes; 0 disables alliances
   startDelay: zb.uint({ max: 600 }).nullable().optional(), // In seconds
   spawnImmunityDuration: zb.uint().nullable().optional(), // In ticks
@@ -325,6 +343,14 @@ export const GameConfigSchema = z.object({
   // ids are private lobby ids, which are join secrets.
   pool: PoolConfigSchema.optional(),
 });
+
+// What a host sends in update_game_config. maxPlayers is the private-lobby
+// player cap: nullable so the host can lift it (null clears, undefined leaves
+// it alone), and at least 2 so a lobby can't be capped down to the host alone.
+export const GameConfigPatchSchema = GameConfigSchema.partial().extend({
+  maxPlayers: zb.uint({ min: 2, max: 1000 }).nullable().optional(),
+});
+export type GameConfigPatch = z.infer<typeof GameConfigPatchSchema>;
 
 export const TeamSchema = z.string();
 
@@ -534,7 +560,7 @@ export const UpdateGameConfigIntentSchema = z.object({
   type: z.literal("update_game_config"),
   // zb.json: too rare and too config-shaped to deserve a binary layout —
   // rides the binary wire as length-prefixed JSON.
-  config: zb.json(GameConfigSchema.partial()),
+  config: zb.json(GameConfigPatchSchema),
 });
 
 export const ToggleGameStartTimerIntentSchema = z.object({

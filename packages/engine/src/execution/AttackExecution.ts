@@ -4,6 +4,7 @@ import {
   MessageType,
   PlayerID,
   PlayerType,
+  Relation,
   TerrainType,
   TerraNullius,
   UnitType,
@@ -177,6 +178,16 @@ export class AttackExecution implements Execution {
       }
     }
 
+    // Nothing next to the owner to conquer (no wilderness around them, or a
+    // target they don't border): the attack doesn't happen. Held until the
+    // next tick, the troops would sit out the regen step and come back free,
+    // so one such attack per tick kept regen at its peak rate and refunded
+    // past maxTroops.
+    if (this.toConquer.size() === 0) {
+      this.retreat();
+      return;
+    }
+
     // Only now is it known how large the attack the defender actually faces
     // is: a big assault is built by clicking repeatedly, and each click's
     // execution absorbs the earlier ones above. Recorded before the loops it
@@ -184,27 +195,33 @@ export class AttackExecution implements Execution {
     // and never landed.
     this.mg.stats().attackMaxIncoming(this.target, this.attack.troops());
 
-    if (this.target.isPlayer()) {
-      const difficulty = this.mg.config().gameConfig().difficulty;
-      let relationChange: number;
-      switch (difficulty) {
-        case Difficulty.Easy:
-          relationChange = -60;
-          break;
-        case Difficulty.Medium:
-          relationChange = -70;
-          break;
-        case Difficulty.Hard:
-          relationChange = -80;
-          break;
-        case Difficulty.Impossible:
-          relationChange = -100;
-          break;
-        default:
-          assertNever(difficulty);
-      }
-      this.target.updateRelation(this._owner, relationChange);
+    if (!this.target.isPlayer()) return;
+    const difficulty = this.mg.config().gameConfig().difficulty;
+    // Hitting back at whoever just attacked us doesn't anger them, except on Easy
+    if (
+      difficulty !== Difficulty.Easy &&
+      this._owner.relation(this.target) === Relation.Hostile
+    ) {
+      return;
     }
+    let relationChange: number;
+    switch (difficulty) {
+      case Difficulty.Easy:
+        relationChange = -60;
+        break;
+      case Difficulty.Medium:
+        relationChange = -70;
+        break;
+      case Difficulty.Hard:
+        relationChange = -80;
+        break;
+      case Difficulty.Impossible:
+        relationChange = -100;
+        break;
+      default:
+        assertNever(difficulty);
+    }
+    this.target.updateRelation(this._owner, relationChange);
   }
 
   private refreshToConquer() {
@@ -260,6 +277,14 @@ export class AttackExecution implements Execution {
     const targetIsPlayer = this.target.isPlayer(); // cache target type
     const targetPlayer = targetIsPlayer ? (this.target as Player) : null; // cache target player
 
+    // Must come before the retreat refund: another attack's init can absorb or
+    // cancel this one on the tick its retreat completes, and refunding troops
+    // that were already handed over duplicates them.
+    if (!this.attack.isActive()) {
+      this.active = false;
+      return;
+    }
+
     if (this.attack.retreated()) {
       if (targetIsPlayer) {
         this.retreat(malusForRetreat);
@@ -271,11 +296,6 @@ export class AttackExecution implements Execution {
     }
 
     if (this.attack.retreating()) {
-      return;
-    }
-
-    if (!this.attack.isActive()) {
-      this.active = false;
       return;
     }
 

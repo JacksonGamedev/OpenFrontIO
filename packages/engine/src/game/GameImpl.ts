@@ -2,9 +2,11 @@ import { GameMap, TileRef } from "@openfront/engine-api/game/GameMap";
 import {
   Cell,
   ColoredTeams,
+  Difficulty,
   Duos,
   EmojiMessage,
   GameMode,
+  GameType,
   GameUpdates,
   HumansVsNations,
   MessageType,
@@ -26,14 +28,19 @@ import {
   GameUpdate,
   GameUpdateType,
 } from "@openfront/engine-api/game/GameUpdates";
-import { UnitPredicate } from "@openfront/engine-api/game/ReadViews";
+import {
+  ReadonlyTileSet,
+  UnitPredicate,
+} from "@openfront/engine-api/game/ReadViews";
 import {
   AllPlayersStats,
   ClientID,
+  GameID,
   Winner,
 } from "@openfront/engine-api/Schemas";
 import { ATTACK_INDEX_SENT } from "@openfront/engine-api/StatsSchemas";
 import { renderNumber } from "@openfront/engine-lib/Format";
+import { GameMapImpl } from "@openfront/engine-lib/game/GameMapImpl";
 import {
   MotionPlanRecord,
   packMotionPlans,
@@ -59,6 +66,9 @@ import {
   SharedWaterCache,
   SharedWaterCacheSnapshot,
 } from "../execution/nation/SharedWaterCache";
+import { NationExecution } from "../execution/NationExecution";
+import { SpawnTimerExecution } from "../execution/SpawnTimerExecution";
+import { TribeExecution } from "../execution/TribeExecution";
 import { AbstractGraph } from "../pathfinding/algorithms/AbstractGraph";
 import { WaterPathFinder } from "../pathfinding/PathFinder";
 import { PathFinder } from "../pathfinding/types";
@@ -92,6 +102,7 @@ import {
   RailNetworkImpl,
   RailNetworkSnapshot,
 } from "./RailNetworkImpl";
+import { Railroad } from "./Railroad";
 import { Stats } from "./Stats";
 import { StatsImpl, StatsSnapshot } from "./StatsImpl";
 import { WaterManager, WaterManagerSnapshot } from "./WaterManager";
@@ -139,6 +150,7 @@ export class GameImpl implements Game {
 
   private updates: GameUpdates = createGameUpdatesMap();
   private tileUpdatePairs: number[] = [];
+  private viewResyncQueued = false;
   /** [smallID, tilesOwned, gold, troops] quads — see PlayerImpl.toUpdate. */
   private playerStatsQuads: number[] = [];
   /** [smallID, direction, index, troops] quads — see packAttackTroopDeltas. */
@@ -302,6 +314,8 @@ export class GameImpl implements Game {
       this._map.setFallout(tile, false);
     }
     this._territoryVersion++;
+    // Rail paths route around water, so a rail plan must be redone too.
+    this._structureVersion++;
     this._map.setWater(tile);
     this.recordTileUpdate(tile);
   }
@@ -534,6 +548,50 @@ export class GameImpl implements Game {
     });
   }
 
+  /**
+   * Queues, with the next tick's updates, what a view with no history needs
+   * to show this game as it stands: a host showing a game restored from a
+   * snapshot never saw the updates that built it. Players need nothing here,
+   * since a restored player's first update is a full one.
+   */
+  queueViewResync(): void {
+    this.viewResyncQueued = true;
+  }
+
+  private addViewResync(): void {
+    const map = this._map as GameMapImpl;
+    const terrainEdited = new Set(map.editedTerrainTiles());
+    const numTiles = map.width() * map.height();
+    for (let tile = 0; tile < numTiles; tile++) {
+      if (map.tileState(tile) !== 0 || terrainEdited.has(tile)) {
+        this.recordTileUpdate(tile);
+      }
+    }
+    // The view never got the motion plans of moves already under way, so
+    // those units report each step instead, as unplanned units do.
+    this.planDrivenUnitIds.clear();
+    for (const unit of this._unitMap.values()) {
+      this.addUpdate(unit.toUpdate());
+    }
+    const railroads = new Set<Railroad>();
+    for (const station of this._railNetwork.stationManager().getAll()) {
+      for (const railroad of station.getRailroads()) railroads.add(railroad);
+    }
+    for (const railroad of railroads) {
+      this.addUpdate({
+        type: GameUpdateType.RailroadConstructionEvent,
+        id: railroad.id,
+        tiles: railroad.tiles,
+      });
+    }
+    if (this.startTick !== null) {
+      this.addUpdate({
+        type: GameUpdateType.SpawnPhaseEnd,
+        startTick: this.startTick,
+      });
+    }
+  }
+
   ticks(): number {
     return this._ticks;
   }
@@ -541,6 +599,10 @@ export class GameImpl implements Game {
   executeNextTick(): GameUpdates {
     this.updates = createGameUpdatesMap();
     this.tileUpdatePairs.length = 0;
+    if (this.viewResyncQueued) {
+      this.viewResyncQueued = false;
+      this.addViewResync();
+    }
     this.execs.forEach((e) => {
       if (
         (!this.inSpawnPhase() || e.activeDuringSpawnPhase()) &&
@@ -549,22 +611,24 @@ export class GameImpl implements Game {
         e.tick(this._ticks);
       }
     });
-    const inited: Execution[] = [];
-    const unInited: Execution[] = [];
-    this.unInitExecs.forEach((e) => {
-      if (!this.inSpawnPhase() || e.activeDuringSpawnPhase()) {
-        e.init(this, this._ticks);
-        inited.push(e);
-      } else {
-        unInited.push(e);
+    if (this.unInitExecs.length > 0) {
+      const inited: Execution[] = [];
+      const unInited: Execution[] = [];
+      for (const e of this.unInitExecs) {
+        if (!this.inSpawnPhase() || e.activeDuringSpawnPhase()) {
+          e.init(this, this._ticks);
+          inited.push(e);
+        } else {
+          unInited.push(e);
+        }
       }
-    });
+      this.execs.push(...inited);
+      this.unInitExecs = unInited;
+    }
 
     this.removeInactiveExecutions();
 
-    this.execs.push(...inited);
-    this.unInitExecs = unInited;
-    for (const player of this._players.values()) {
+    for (const player of this._playersBySmallID) {
       // Sampled before toUpdate so the reading is of the tick that just ran.
       // Dead and unspawned players are skipped: an eliminated player's fall
       // to zero tiles would otherwise register as a total collapse.
@@ -594,6 +658,8 @@ export class GameImpl implements Game {
     for (const tile of waterChangedTiles) {
       this.recordTileUpdate(tile);
     }
+    // Queued conversions write the map directly, bypassing setWater.
+    if (waterChangedTiles.length > 0) this._structureVersion++;
     this._ticks++;
     return this.updates;
   }
@@ -678,6 +744,9 @@ export class GameImpl implements Game {
     this._players.forEach((p) => {
       hash += p.hash();
     });
+    // Rails are not units, so without this a divergence in which rails got
+    // built would only show up through the trains that later run on them.
+    hash += this._railNetwork.hash();
     return hash;
   }
 
@@ -704,11 +773,11 @@ export class GameImpl implements Game {
   }
 
   players(): Player[] {
-    return Array.from(this._players.values()).filter((p) => p.isAlive());
+    return this._playersBySmallID.filter((p) => p.isAlive());
   }
 
   allPlayers(): Player[] {
-    return Array.from(this._players.values());
+    return this._playersBySmallID.slice();
   }
 
   executions(): Execution[] {
@@ -724,6 +793,110 @@ export class GameImpl implements Game {
     this.unInitExecs = this.unInitExecs.filter(
       (execution) => execution !== exec,
     );
+  }
+
+  takeoverPlayer(player: Player | PlayerID, localClientID: ClientID): void {
+    const target = typeof player === "string" ? this.player(player) : player;
+
+    const oldClientID = target.clientID();
+    if (oldClientID !== null) {
+      this._stats.migrateClientID(oldClientID, localClientID);
+    }
+
+    // Remove any NationExecution or TribeExecution controlling this player
+    for (const exec of this.executions()) {
+      if (
+        (exec instanceof NationExecution || exec instanceof TribeExecution) &&
+        exec.playerID() === target.id()
+      ) {
+        this.removeExecution(exec);
+      }
+    }
+
+    // Update chosen player to be the local human
+    const chosenInfo = target.info();
+    const updatedChosenInfo = new PlayerInfo(
+      chosenInfo.name,
+      PlayerType.Human,
+      localClientID,
+      chosenInfo.id,
+      chosenInfo.isLobbyCreator,
+      chosenInfo.clanTag,
+      chosenInfo.friends,
+      chosenInfo.teamIndex,
+      chosenInfo.nationFlag,
+    );
+    target.setPlayerInfo(updatedChosenInfo);
+    target.markDisconnected(false);
+
+    this._humans = this._humans.filter((h) => h.id !== target.id());
+    this._humans.push(updatedChosenInfo);
+    this._nations = this._nations.filter(
+      (n) => n.playerInfo.id !== target.id(),
+    );
+  }
+
+  clearHumanPlayer(player: Player | PlayerID): void {
+    const target = typeof player === "string" ? this.player(player) : player;
+    const pInfo = target.info();
+    const updatedBotInfo = new PlayerInfo(
+      pInfo.name,
+      PlayerType.Nation,
+      null,
+      pInfo.id,
+      false,
+      pInfo.clanTag,
+      pInfo.friends,
+      pInfo.teamIndex,
+      pInfo.nationFlag,
+    );
+    target.setPlayerInfo(updatedBotInfo);
+    target.markDisconnected(false);
+
+    this._humans = this._humans.filter((h) => h.id !== target.id());
+  }
+
+  clearOtherHumans(keptPlayer: Player | PlayerID): void {
+    const target =
+      typeof keptPlayer === "string" ? this.player(keptPlayer) : keptPlayer;
+    this._humans = this._humans.filter((h) => h.id === target.id());
+  }
+
+  convertHumanToNation(player: Player | PlayerID, gameID: GameID): Execution {
+    const target = typeof player === "string" ? this.player(player) : player;
+    this.clearHumanPlayer(target);
+
+    this._nations = this._nations.filter(
+      (n) => n.playerInfo.id !== target.id(),
+    );
+    const spawnTile = target.spawnTile();
+    const spawnCell =
+      spawnTile !== undefined ? this.cell(spawnTile) : undefined;
+    const nation = new Nation(spawnCell, target.info());
+    this._nations.push(nation);
+
+    const nationExec = new NationExecution(gameID, nation);
+    this.addExecution(nationExec);
+    return nationExec;
+  }
+
+  applySingleplayerConfig(difficulty?: Difficulty): void {
+    this.config().setGameType(GameType.Singleplayer);
+    if (difficulty !== undefined) {
+      this.config().setDifficulty(difficulty);
+    }
+    for (const exec of this.executions()) {
+      if (exec instanceof SpawnTimerExecution) {
+        this.removeExecution(exec);
+      } else if (
+        difficulty !== undefined &&
+        exec instanceof NationExecution &&
+        exec.isActive() &&
+        exec.isInitialized()
+      ) {
+        exec.refreshDifficulty();
+      }
+    }
   }
 
   playerView(id: PlayerID): Player {
@@ -1153,8 +1326,9 @@ export class GameImpl implements Game {
     unitID: number,
     message: string,
     type: MessageType,
-    playerID: PlayerID,
+    playerID: PlayerID | null,
   ): void {
+    if (playerID === null) return;
     const id = this.player(playerID).smallID();
 
     this.addUpdate({
@@ -1177,6 +1351,26 @@ export class GameImpl implements Game {
     this._unitsVersion++;
   }
 
+  // Bumped when a City, Port or Factory is added or removed (the structures
+  // the rail network connects) and when land turns to water (rail paths route
+  // around it), so rail previews can be memoised while the trains, shells and
+  // boats that churn _unitsVersion come and go.
+  private _structureVersion = 0;
+  structureVersion(): number {
+    return this._structureVersion;
+  }
+  /** Call when a unit the rail network cares about appears, vanishes or changes visibility. */
+  noteStructureChange(u: Unit): void {
+    const type = u.type();
+    if (
+      type === UnitType.City ||
+      type === UnitType.Port ||
+      type === UnitType.Factory
+    ) {
+      this._structureVersion++;
+    }
+  }
+
   // Bumped on every change of tile ownership, fallout or land/water — i.e.
   // anything Player.nearby() can observe — so per-player answers can be memoised
   // for as long as nothing on the map moved.
@@ -1187,11 +1381,13 @@ export class GameImpl implements Game {
 
   addUnit(u: Unit) {
     this._unitsVersion++;
+    this.noteStructureChange(u);
     this.unitGrid.addUnit(u);
     this._unitMap.set(u.id(), u);
   }
   removeUnit(u: Unit) {
     this._unitsVersion++;
+    this.noteStructureChange(u);
     this.unitGrid.removeUnit(u);
     this._unitMap.delete(u.id());
     this.planDrivenUnitIds.delete(u.id());
@@ -1376,10 +1572,17 @@ export class GameImpl implements Game {
   ): Set<TileRef> {
     return this._map.circleSearch(tile, radius, filter);
   }
+  bfsSearch(
+    tile: TileRef,
+    filter: (gm: GameMap, tile: TileRef) => boolean,
+    onVisit?: (tile: TileRef) => boolean | void,
+  ): boolean {
+    return this._map.bfsSearch(tile, filter, onVisit);
+  }
   bfs(
     tile: TileRef,
     filter: (gm: GameMap, tile: TileRef) => boolean,
-  ): Set<TileRef> {
+  ): ReadonlyTileSet {
     return this._map.bfs(tile, filter);
   }
   tileState(tile: TileRef): number {
@@ -1533,6 +1736,8 @@ export class GameImpl implements Game {
           : r.player(s.winner.player);
     this._unitsVersion = s.unitsVersion;
     this._territoryVersion = s.territoryVersion;
+    // Not snapshotted: it only keys memos, which must not outlive the restore.
+    this._structureVersion++;
     this.shipStaggers = { ...s.shipStaggers };
     this._nationMirvTargets = new Map(s.nationMirvTargets);
     this._mirvsLaunched = s.mirvsLaunched;
@@ -1676,13 +1881,14 @@ export const GameSnapshot = snapshotType({
 });
 export type GameState = z.infer<typeof GameSnapshot.schema>;
 
-// Or a more dynamic approach that will catch new enum values:
+const ALL_GAME_UPDATE_TYPES: readonly GameUpdateType[] = Object.values(
+  GameUpdateType,
+).filter((key): key is GameUpdateType => typeof key === "number");
+
 const createGameUpdatesMap = (): GameUpdates => {
   const map = {} as GameUpdates;
-  Object.values(GameUpdateType)
-    .filter((key) => !isNaN(Number(key))) // Filter out reverse mappings
-    .forEach((key) => {
-      map[key as GameUpdateType] = [];
-    });
+  for (let i = 0; i < ALL_GAME_UPDATE_TYPES.length; i++) {
+    map[ALL_GAME_UPDATE_TYPES[i]] = [];
+  }
   return map;
 };

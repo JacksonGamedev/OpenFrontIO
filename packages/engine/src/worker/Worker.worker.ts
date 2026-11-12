@@ -4,6 +4,10 @@ import {
 } from "@openfront/engine-api/game/GameUpdates";
 import {
   AttackClusteredPositionsResultMessage,
+  ExtractSnapshotErrorMessage,
+  ExtractSnapshotResultMessage,
+  HumanDisconnectsResultMessage,
+  HumanStatsResultMessage,
   InitErrorMessage,
   InitializedMessage,
   MainThreadMessage,
@@ -12,6 +16,7 @@ import {
   PlayerBorderTilesResultMessage,
   PlayerBuildablesResultMessage,
   PlayerProfileResultMessage,
+  ReadSnapshotHeaderResultMessage,
   RunTurnsResultMessage,
   SnapshotResultMessage,
   TransportShipSpawnResultMessage,
@@ -22,6 +27,8 @@ import {
   createGameRunnerFromSnapshot,
   GameRunner,
 } from "../GameRunner";
+import { readSnapshotHeader } from "../snapshot/GameSnapshot";
+import { extractSnapshot } from "../snapshot/SnapshotExtractor";
 
 const ctx: Worker = self as any;
 // Where answers go: the page that started this worker, or the port it
@@ -143,6 +150,12 @@ function transfersOf(gameUpdates: GameUpdateViewData[]): Transferable[] {
     if (gu.packedNukeImpacts) {
       transfers.push(gu.packedNukeImpacts.buffer);
     }
+    if (gu.packedUnitUpdates) {
+      transfers.push(gu.packedUnitUpdates.buffer);
+    }
+    if (gu.packedMissileTimers) {
+      transfers.push(gu.packedMissileTimers.buffer);
+    }
   }
   return transfers;
 }
@@ -169,7 +182,12 @@ async function onMessage(e: MessageEvent<MainThreadMessage>) {
                 message.clientID,
                 message.map,
                 gameUpdate,
-              )
+              ).then((gr) => {
+                // The page's view starts empty, so the first tick carries
+                // the state the snapshot restored.
+                gr.game.queueViewResync();
+                return gr;
+              })
             : createGameRunner(
                 message.gameStartInfo,
                 message.clientID,
@@ -289,6 +307,7 @@ async function onMessage(e: MessageEvent<MainThreadMessage>) {
           message.x,
           message.y,
           message.units,
+          message.includeBuildPreview,
         );
         sendMessage({
           type: "player_buildables_result",
@@ -314,6 +333,42 @@ async function onMessage(e: MessageEvent<MainThreadMessage>) {
         } as PlayerProfileResultMessage);
       } catch (error) {
         console.error("Failed to get profile:", error);
+        throw error;
+      }
+      break;
+    case "human_stats":
+      if (!gameRunner) {
+        throw new Error("Game runner not initialized");
+      }
+
+      try {
+        // Messages are handled between drain batches: a tick boundary.
+        const result = (await gameRunner).humanStats();
+        sendMessage({
+          type: "human_stats_result",
+          id: message.id,
+          result,
+        } as HumanStatsResultMessage);
+      } catch (error) {
+        console.error("Failed to get human stats:", error);
+        throw error;
+      }
+      break;
+    case "human_disconnects":
+      if (!gameRunner) {
+        throw new Error("Game runner not initialized");
+      }
+
+      try {
+        // As human_stats: between drain batches, a tick boundary.
+        const result = (await gameRunner).humanDisconnects();
+        sendMessage({
+          type: "human_disconnects_result",
+          id: message.id,
+          result,
+        } as HumanDisconnectsResultMessage);
+      } catch (error) {
+        console.error("Failed to get human disconnects:", error);
         throw error;
       }
       break;
@@ -399,6 +454,58 @@ async function onMessage(e: MessageEvent<MainThreadMessage>) {
         } as SnapshotResultMessage,
         snapshot ? [snapshot.buffer] : [],
       );
+      break;
+    }
+    case "read_snapshot_header": {
+      // Needs no game: the page asks before it knows what to start.
+      let result: ReadSnapshotHeaderResultMessage;
+      try {
+        result = {
+          type: "read_snapshot_header_result",
+          id: message.id,
+          header: readSnapshotHeader(message.snapshot),
+        };
+      } catch (error) {
+        result = {
+          type: "read_snapshot_header_result",
+          id: message.id,
+          header: null,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+      sendMessage(result);
+      break;
+    }
+    case "extract_snapshot": {
+      try {
+        const result = await extractSnapshot({
+          gameStartInfo: message.gameStartInfo,
+          turns: message.turns,
+          mapFiles: message.map,
+          targetTick: message.targetTick,
+          chosenPlayerID: message.chosenPlayerID,
+          localClientID: message.localClientID,
+          difficulty: message.difficulty,
+          newGameID: message.newGameID,
+        });
+        out.postMessage(
+          {
+            type: "extract_snapshot_result",
+            id: message.id,
+            snapshot: result.snapshot,
+            gameStartInfo: result.gameStartInfo,
+            tick: result.tick,
+          } as ExtractSnapshotResultMessage,
+          [result.snapshot.buffer],
+        );
+      } catch (error) {
+        console.error("Failed to extract snapshot:", error);
+        out.postMessage({
+          type: "extract_snapshot_error",
+          id: message.id,
+          error: error instanceof Error ? error.message : String(error),
+        } as ExtractSnapshotErrorMessage);
+      }
       break;
     }
     default:

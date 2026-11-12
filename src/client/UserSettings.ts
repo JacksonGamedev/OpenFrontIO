@@ -1,5 +1,11 @@
+import { Emoji, flattenedEmojiTable } from "@openfront/engine-api/Schemas";
 import { Cosmetics } from "@openfront/shared/CosmeticSchemas";
 import { PlayerPattern } from "@openfront/shared/WireSchemas";
+import {
+  LOBBY_PRESETS_KEY,
+  LobbyPreset,
+  parseLobbyPresetsJson,
+} from "./LobbyPresets";
 import {
   GraphicsOverrides,
   GraphicsOverridesSchema,
@@ -15,11 +21,14 @@ import {
 // DesktopShell.ts imports nothing, so this cannot introduce an import cycle
 // (verified with madge: 58 cycles before and after, none involving it).
 import { isDesktopShell } from "./DesktopShell";
+import type { RandomNameStyle } from "./PlayerName";
 
 export function getDefaultKeybinds(isMac: boolean): Record<string, string> {
   return {
     toggleView: "Space",
+    preventStacking: "KeyH",
     coordinateGrid: "KeyM",
+    performanceOverlay: "Shift+KeyD",
     buildCity: "Digit1",
     buildFactory: "Digit2",
     buildPort: "Digit3",
@@ -37,20 +46,35 @@ export function getDefaultKeybinds(isMac: boolean): Record<string, string> {
     retaliateAttack: "Shift+KeyR",
     requestAlliance: "KeyK",
     breakAlliance: "KeyL",
+    targetPlayer: "KeyN",
+    donateTroops: "KeyJ",
+    donateGold: "KeyO",
+    emojiMenu: "KeyF",
+    quickChat: "KeyR",
+    playerPanel: "KeyI",
     swapDirection: "KeyU",
     zoomOut: "KeyQ",
     zoomIn: "KeyE",
+    zoomOutMinus: "Minus",
+    zoomOutNumpad: "NumpadSubtract",
+    zoomInEqual: "Equal",
+    zoomInNumpad: "NumpadAdd",
     centerCamera: "KeyC",
     moveUp: "KeyW",
     moveLeft: "KeyA",
     moveDown: "KeyS",
     moveRight: "KeyD",
+    moveUpArrow: "ArrowUp",
+    moveLeftArrow: "ArrowLeft",
+    moveDownArrow: "ArrowDown",
+    moveRightArrow: "ArrowRight",
     buildMenuModifier: isMac ? "MetaLeft" : "ControlLeft",
+    buildScrollModifier: "AltLeft",
     emojiMenuModifier: "AltLeft",
     boxSelectWarships: "ShiftLeft",
     shiftKey: "ShiftLeft",
     resetGfx: "KeyR",
-    selectAllWarships: "KeyF",
+    selectAllWarships: "KeyX",
     pauseGame: "KeyP",
     gameSpeedUp: "Period",
     gameSpeedDown: "Comma",
@@ -58,7 +82,31 @@ export function getDefaultKeybinds(isMac: boolean): Record<string, string> {
   };
 }
 
+// Actions that may share a key. Reset graphics only fires with its modifier
+// (altKey) held, and quick chat only without one.
+const SHARED_KEY_ACTIONS: ReadonlyArray<readonly [string, string, string?]> = [
+  ["quickChat", "resetGfx"],
+  // Allow only the intended physical modifier pairs to share a key.
+  ["buildScrollModifier", "emojiMenuModifier", "Alt"],
+  ["altKey", "emojiMenuModifier", "Alt"],
+  ["buildScrollModifier", "altKey", "Alt"],
+  ["boxSelectWarships", "shiftKey", "Shift"],
+];
+
+/** Whether actions `a` and `b` may be bound to the same key. */
+export function keysMayBeShared(a: string, b: string, key?: string): boolean {
+  return SHARED_KEY_ACTIONS.some(
+    ([x, y, keyPrefix]) =>
+      ((a === x && b === y) || (a === y && b === x)) &&
+      (!keyPrefix ||
+        [`${keyPrefix}Left`, `${keyPrefix}Right`].includes(key ?? "")),
+  );
+}
+
 export const USER_SETTINGS_CHANGED_EVENT = "event:user-settings-changed";
+
+// index.html reads this key directly to set the theme class before first paint.
+const HALLOWEEN_THEME_KEY = "settings.halloweenTheme";
 
 /**
  * Mixer channels. Category is a pure function of the cue name (categoryOf in
@@ -173,8 +221,9 @@ const AUDIO_LEGACY_KEY: Partial<Record<AudioCategory, string>> = {
 export const PATTERN_KEY = "territoryPattern";
 export const FLAG_KEY = "flag";
 export const CROWN_KEY = "crown";
-export const COLOR_KEY = "settings.territoryColor";
 export const PERFORMANCE_OVERLAY_KEY = "settings.performanceOverlay";
+// Kept out of the graphics overrides so picking a preset doesn't turn it back on.
+export const MAP_LAYERS_KEY = "settings.mapLayers";
 export const KEYBINDS_KEY = "settings.keybinds";
 export const GRAPHICS_KEY = "settings.graphics";
 export const GRAPHICS_PRESETS_KEY = "settings.graphicsPresets";
@@ -186,6 +235,7 @@ export const ACTIVE_LOADOUT_KEY = "settings.activeLoadout";
 // Keep the existing storage key so the rename does not reset saved columns.
 export const PLAYER_STATS_COLUMNS_KEY = "settings.leaderboardColumns";
 export const TEAM_STATS_COLUMNS_KEY = "settings.teamStatsColumns";
+export const FAVORITE_EMOJIS_KEY = "settings.favoriteEmojis";
 const STATS_COLUMNS_KEYS: Record<StatsTableKind, string> = {
   player: PLAYER_STATS_COLUMNS_KEY,
   team: TEAM_STATS_COLUMNS_KEY,
@@ -224,7 +274,7 @@ export interface CosmeticLoadout {
 export const MAX_LOADOUTS = 10;
 
 /** Slots are numbered rather than named: "01", "02", … */
-export function loadoutSlotName(slot: number): string {
+function loadoutSlotName(slot: number): string {
   return slot.toString().padStart(2, "0");
 }
 
@@ -292,6 +342,11 @@ export class UserSettings {
     for (const key of PER_PLAYER_KEYS) {
       settings.emitChange(key, settings.getCached(key));
     }
+  }
+
+  /** publicId of the logged-in player, or null when logged out. */
+  static currentPlayerId(): string | null {
+    return UserSettings.playerId;
   }
 
   private storageKey(key: string): string {
@@ -382,8 +437,20 @@ export class UserSettings {
     return this.getBool("settings.emojis", true);
   }
 
+  hudOpacity() {
+    return Math.max(0, Math.min(1, this.getFloat("settings.hudOpacity", 1)));
+  }
+
+  setHudOpacity(value: number) {
+    this.setFloat("settings.hudOpacity", value);
+  }
+
   performanceOverlay() {
     return this.getBool(PERFORMANCE_OVERLAY_KEY, false);
+  }
+
+  mapLayers() {
+    return this.getBool(MAP_LAYERS_KEY, true);
   }
 
   alertFrame() {
@@ -392,6 +459,16 @@ export class UserSettings {
 
   anonymousNames() {
     return this.getBool("settings.anonymousNames", false);
+  }
+
+  randomNameStyle(): RandomNameStyle {
+    return this.getCached("settings.randomNameStyle") === "tribe"
+      ? "tribe"
+      : "anon";
+  }
+
+  setRandomNameStyle(style: RandomNameStyle): void {
+    this.setCached("settings.randomNameStyle", style);
   }
 
   lobbyIdVisibility() {
@@ -408,10 +485,10 @@ export class UserSettings {
 
   /**
    * "Watch replay" opens the new replay viewer instead of the classic
-   * replay. Opt-in while the viewer is rolled out.
+   * replay. Enabled by default.
    */
   replayViewer() {
-    return this.getBool("settings.replayViewer", false);
+    return this.getBool("settings.replayViewer", true);
   }
 
   setReplayViewer(value: boolean) {
@@ -459,6 +536,14 @@ export class UserSettings {
     return this.getBool("settings.cursorCostLabel", legacy);
   }
 
+  snapBuildPreview() {
+    return this.getBool("settings.snapBuildPreview", false);
+  }
+
+  toggleSnapBuildPreview() {
+    this.setBool("settings.snapBuildPreview", !this.snapBuildPreview());
+  }
+
   toggleLeftClickOpenMenu() {
     this.setBool("settings.leftClickOpensMenu", !this.leftClickOpensMenu());
   }
@@ -467,13 +552,18 @@ export class UserSettings {
     this.setBool("settings.emojis", !this.emojis());
   }
 
-  // Performance overlay specifically needs a direct setter for Shift-D
+  // The performance overlay's close button needs a direct setter to persist
+  // visibility.
   setPerformanceOverlay(value: boolean) {
     this.setBool(PERFORMANCE_OVERLAY_KEY, value);
   }
 
   togglePerformanceOverlay() {
     this.setBool(PERFORMANCE_OVERLAY_KEY, !this.performanceOverlay());
+  }
+
+  toggleMapLayers() {
+    this.setBool(MAP_LAYERS_KEY, !this.mapLayers());
   }
 
   toggleAlertFrame() {
@@ -510,6 +600,14 @@ export class UserSettings {
 
   toggleGoToPlayer() {
     this.setBool("settings.goToPlayer", !this.goToPlayer());
+  }
+
+  halloweenTheme() {
+    return this.getBool(HALLOWEEN_THEME_KEY, true);
+  }
+
+  toggleHalloweenTheme() {
+    this.setBool(HALLOWEEN_THEME_KEY, !this.halloweenTheme());
   }
 
   nukeAllianceSafetyDuration(): number {
@@ -839,6 +937,28 @@ export class UserSettings {
   }
 
   /**
+   * The emoji table's favorites, one entry per slot, null for an empty slot.
+   * Unknown or corrupt entries read as empty.
+   */
+  favoriteEmojis(): (Emoji | null)[] {
+    const raw = this.getString(FAVORITE_EMOJIS_KEY, "");
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((e) =>
+        flattenedEmojiTable.includes(e) ? (e as Emoji) : null,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  setFavoriteEmojis(slots: readonly (Emoji | null)[]): void {
+    this.setString(FAVORITE_EMOJIS_KEY, JSON.stringify(slots));
+  }
+
+  /**
    * Channel volume, 0-1. Falls back to the legacy key before the default, so
    * an existing player keeps the level they chose. A stored 0 is respected:
    * the only writer is a slider drag, so 0 is always a deliberate choice and
@@ -1067,6 +1187,56 @@ export class UserSettings {
     return this.getString(GRAPHICS_PRESETS_KEY, "") !== "";
   }
 
+  /**
+   * Retrieves and parses the player's saved lobby configuration presets directly from storage.
+   * Returns an empty array if storage access fails, key is unset, or validation fails.
+   */
+  getLobbyPresets(): LobbyPreset[] {
+    try {
+      const storageKey = this.storageKey(LOBBY_PRESETS_KEY);
+      const raw = localStorage.getItem(storageKey);
+      UserSettings.cache.set(storageKey, raw);
+      return parseLobbyPresetsJson(raw);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Retrieves the raw stored JSON array of lobby presets, without schema validation.
+   * Preserves unknown fields and entries that fail current validation.
+   * Returns an empty array if storage access fails, key is unset, or the stored JSON is not an array.
+   */
+  getRawLobbyPresets(): unknown[] {
+    try {
+      const storageKey = this.storageKey(LOBBY_PRESETS_KEY);
+      const raw = localStorage.getItem(storageKey);
+      UserSettings.cache.set(storageKey, raw);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Persists the given array of lobby presets to storage. Clears the key if empty.
+   * Returns true on successful write, or false if storage access fails.
+   */
+  setLobbyPresets(presets: readonly unknown[]): boolean {
+    try {
+      if (presets.length === 0) {
+        this.removeCached(LOBBY_PRESETS_KEY);
+      } else {
+        this.setString(LOBBY_PRESETS_KEY, JSON.stringify(presets));
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // In case localStorage was manually edited to be invalid, return an empty object
   parsedUserKeybinds(): Record<string, any> {
     const raw = this.getString(KEYBINDS_KEY, "{}");
@@ -1102,6 +1272,7 @@ export class UserSettings {
   }
 
   keybinds(isMac: boolean): Record<string, string> {
+    this.unbindDefaultsOnPlayerKeys(isMac);
     const merged = {
       ...getDefaultKeybinds(isMac),
       ...this.normalizedUserKeybinds(),
@@ -1116,6 +1287,38 @@ export class UserSettings {
     }
 
     return merged;
+  }
+
+  /**
+   * Storage only holds the actions a player changed, so a default added or
+   * moved later can land on a key they already use for something else, and
+   * one press would fire both. When that happens, save the default as
+   * unbound (as the settings modal's Unbind does): the player's own choice
+   * wins, and the settings modal shows the default as unbound too.
+   */
+  private unbindDefaultsOnPlayerKeys(isMac: boolean): void {
+    const user = this.normalizedUserKeybinds();
+    // Modifier keys are shared on purpose (e.g. Alt for altKey and
+    // emojiMenuModifier), so only ordinary keys count as clashes.
+    const taken = Object.entries(user).filter(
+      ([, v]) =>
+        v !== "Null" && !/^(Alt|Shift|Control|Meta)(Left|Right)$/.test(v),
+    );
+    const defaults = getDefaultKeybinds(isMac);
+    const clashing = Object.keys(defaults).filter(
+      (action) =>
+        !(action in user) &&
+        taken.some(
+          ([other, v]) =>
+            v === defaults[action] && !keysMayBeShared(action, other),
+        ),
+    );
+    if (clashing.length === 0) return;
+    const stored = this.parsedUserKeybinds();
+    for (const action of clashing) {
+      stored[action] = { value: "Null", key: "" };
+    }
+    this.setKeybinds(stored);
   }
 
   setKeybinds(value: string | Record<string, any>): void {

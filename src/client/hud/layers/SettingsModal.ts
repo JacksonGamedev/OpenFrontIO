@@ -1,16 +1,35 @@
+import { GameType } from "@openfront/engine-api/game/GameTypes";
+import { GameConfig } from "@openfront/engine-api/Schemas";
 import { assetUrl } from "@openfront/shared/AssetUrls";
 import { EventBus } from "@openfront/shared/EventBus";
 import { html, LitElement } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
-import { crazyGamesSDK } from "src/client/CrazyGamesSDK";
+import { gamePortal } from "src/client/GamePortal";
 import { PauseGameIntentEvent } from "src/client/Transport";
+import { responseHasLinkedIdentity } from "../../AccountIdentity";
+import { ClientEnv } from "../../ClientEnv";
 import { Controller } from "../../Controller";
 import {
   AlternateViewEvent,
   ToggleRenderDebugGuiEvent,
 } from "../../InputHandler";
+import { type SavedGameError, uploadSavedGame } from "../../SavedGamesApi";
+import { lastUserMeResponse } from "../../UserMeBroadcast";
 import type { UserSettingModal } from "../../UserSettingModal";
-import { homeHref, translateText } from "../../Utils";
+import {
+  disabledUnitsBox,
+  FLAT_SETTING_TAG,
+  formatGameType,
+  formatGameVisibility,
+  hostCheatsBox,
+  hostCheatsList,
+  lobbySettingTagText,
+  MODE_BADGE_CLASS,
+  notableLobbySettings,
+  VISIBILITY_BADGE_CLASS,
+} from "../../utilities/LobbySettingsSummary";
+import { getMapName, homeHref, translateText } from "../../Utils";
+import type { GameView } from "../../view/GameView";
 const exitIcon = assetUrl("images/ExitIconWhite.svg");
 const settingsIcon = assetUrl("images/SettingIconWhite.svg");
 const treeIcon = assetUrl("images/TreeIconWhite.svg");
@@ -27,8 +46,9 @@ export class ShowSettingsModalEvent {
  * The in-game menu.
  *
  * It holds what is session state or a game action — the alternate (terrain)
- * view, the debug GUI, exiting — plus a link into the settings modal. Every
- * `UserSettings`-backed row it used to duplicate, the advanced graphics
+ * view, the debug GUI, exiting — plus the game's modifiers (the non-default
+ * lobby settings the join modal shows) and a link into the settings modal.
+ * Every `UserSettings`-backed row it used to duplicate, the advanced graphics
  * options included, now lives in `UserSettingModal`, which this opens through
  * the non-inline `#game-settings` instance so both entry points render the
  * same UI.
@@ -52,14 +72,70 @@ export class SettingsModal extends LitElement implements Controller {
   @property({ type: Boolean })
   wasPausedWhenOpened = false;
 
+  @property({ attribute: false })
+  gameConfig: GameConfig | null = null;
+
+  /** Nations the map defines; null skips the nation-count comparison. */
+  @property({ attribute: false })
+  mapNationCount: number | null = null;
+
+  /** Nation-relative timestamp or indicator for hosted vs private games. */
+  @property({ type: Number })
+  visibleAt?: number;
+
+  /** The running game, for saving it. */
+  @property({ attribute: false })
+  game: GameView | null = null;
+
+  @state()
+  private saveStatus: "saving" | "saved" | SavedGameError | null = null;
+
   init() {
+    // The view can also be switched by the toggle-view key and the sidebar
+    // button; keep this toggle in step.
+    this.eventBus.on(AlternateViewEvent, (event) => {
+      this.alternateView = event.alternateView;
+      this.requestUpdate();
+    });
     this.eventBus.on(ShowSettingsModalEvent, (event) => {
       this.isVisible = event.isVisible;
       this.shouldPause = event.shouldPause;
       this.wasPausedWhenOpened = event.isPaused;
+      // A save's outcome is news once; the next opening starts clean.
+      if (this.saveStatus !== "saving") this.saveStatus = null;
       this.pauseGame(true);
     });
   }
+
+  private isDesktopQuery =
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(min-width: 640px)")
+      : null;
+
+  private get isDesktop(): boolean {
+    return this.isDesktopQuery?.matches ?? true;
+  }
+
+  private handleMediaChange = () => {
+    this.isAnimating = false;
+    const details = this.renderRoot?.querySelector(
+      "details[data-game-modifiers]",
+    ) as HTMLDetailsElement | null;
+    if (details) {
+      details.classList.remove("is-closing");
+      details.open = this.isDesktop;
+      const wrapper = details.querySelector(
+        ".details-grid-wrapper",
+      ) as HTMLElement | null;
+      if (wrapper) {
+        wrapper.style.transition = "none";
+        wrapper.style.gridTemplateRows = "";
+        void wrapper.offsetHeight;
+        wrapper.style.transition = "";
+      }
+    }
+    this.requestUpdate();
+  };
 
   createRenderRoot() {
     return this;
@@ -69,11 +145,13 @@ export class SettingsModal extends LitElement implements Controller {
     super.connectedCallback();
     window.addEventListener("click", this.handleOutsideClick, true);
     window.addEventListener("keydown", this.handleKeyDown);
+    this.isDesktopQuery?.addEventListener("change", this.handleMediaChange);
   }
 
   disconnectedCallback() {
     window.removeEventListener("click", this.handleOutsideClick, true);
     window.removeEventListener("keydown", this.handleKeyDown);
+    this.isDesktopQuery?.removeEventListener("change", this.handleMediaChange);
     super.disconnectedCallback();
   }
 
@@ -110,12 +188,12 @@ export class SettingsModal extends LitElement implements Controller {
   }
 
   private pauseGame(pause: boolean) {
-    // CrazyGames: report gameplay as stopped whenever the settings menu is open,
+    // Portals: report gameplay as stopped whenever the settings menu is open,
     // and resumed when it closes — unless the game was already paused when opened.
     if (pause) {
-      crazyGamesSDK.gameplayStop();
+      void gamePortal.gameplayStop();
     } else if (!this.wasPausedWhenOpened) {
-      crazyGamesSDK.gameplayStart();
+      void gamePortal.gameplayStart();
     }
 
     // Only pause the simulation itself when we own the pause (singleplayer or
@@ -160,9 +238,432 @@ export class SettingsModal extends LitElement implements Controller {
     this.closeModal();
   }
 
+  private onOpenGraphicsButtonClick() {
+    const settings = document.getElementById(
+      "game-settings",
+    ) as UserSettingModal | null;
+    if (!settings?.openGraphicsPanel(() => this.openModal())) return;
+    this.closeModal({ keepPause: true });
+  }
+
+  // Saves are kept on the player's account: singleplayer games only, and
+  // only for a signed-in account, since a guest's saves would be lost with
+  // the browser's session. Not the onboarding tutorial: its overlay keeps
+  // state a save doesn't carry, so a resumed one could get stuck.
+  private canSave(): boolean {
+    const game = this.game;
+    return (
+      game !== null &&
+      game.config().gameConfig().gameType === GameType.Singleplayer &&
+      game.config().gameConfig().tutorial !== true &&
+      !game.config().isReplay() &&
+      responseHasLinkedIdentity(lastUserMeResponse()?.response ?? false)
+    );
+  }
+
+  private async onSaveButtonClick() {
+    const game = this.game;
+    if (game === null || this.saveStatus === "saving") return;
+    this.saveStatus = "saving";
+    try {
+      // The menu has paused the game, so this is the moment the player sees.
+      const snapshot = await game.worker.snapshot(ClientEnv.gitCommit());
+      const map = game.config().gameConfig().gameMap;
+      const result = await uploadSavedGame(snapshot, {
+        name: defaultSaveName(getMapName(map) ?? map, new Date()),
+        map,
+        tick: game.ticks(),
+      });
+      this.saveStatus = typeof result === "string" ? result : "saved";
+    } catch (err) {
+      console.warn("Failed to save the game", err);
+      this.saveStatus = "request_failed";
+    }
+  }
+
+  private renderSaveRow() {
+    if (!this.canSave()) return null;
+    const status = this.saveStatus;
+    const desc =
+      status === null
+        ? translateText("saved_games.save_desc")
+        : translateText(`saved_games.save_status.${status}`);
+    return html`
+      <button
+        class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors disabled:opacity-60"
+        data-save-game
+        ?disabled=${status === "saving"}
+        @click="${this.onSaveButtonClick}"
+      >
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path
+            d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"
+          />
+          <path d="M17 21v-8H7v8M7 3v5h8" />
+        </svg>
+        <div class="flex-1">
+          <div class="font-medium">
+            ${translateText("saved_games.save_label")}
+          </div>
+          <div class="text-sm text-slate-400" data-save-status>${desc}</div>
+        </div>
+      </button>
+    `;
+  }
+
   private onExitButtonClick() {
     // redirect to the home page
     window.location.href = homeHref();
+  }
+
+  private renderHeaderBadges() {
+    const c = this.gameConfig ?? this.game?.config().gameConfig() ?? null;
+    if (c === null) return null;
+    const visibleAt = this.visibleAt;
+    return html`
+      <div
+        class="flex flex-wrap items-center gap-2 px-3 pt-1"
+        data-header-badges
+      >
+        <span class="border rounded-md ${MODE_BADGE_CLASS}"
+          >${formatGameType(c)}</span
+        >
+        <span class="border rounded-md ${VISIBILITY_BADGE_CLASS}"
+          >${formatGameVisibility(c.gameType, visibleAt)}</span
+        >
+      </div>
+    `;
+  }
+
+  private getModifierData() {
+    const c = this.gameConfig ?? this.game?.config().gameConfig() ?? null;
+    if (c === null) {
+      return {
+        c: null,
+        settings: [],
+        cheats: [],
+        hasModifiers: false,
+        isSplitView: false,
+      };
+    }
+    const settings = notableLobbySettings(c, this.mapNationCount);
+    const hasDisabledUnits = (c.disabledUnits?.length ?? 0) > 0;
+    const cheats = hostCheatsList(c);
+    const hasHostCheats = cheats.length > 0;
+    const hasModifiers =
+      settings.length > 0 || hasDisabledUnits || hasHostCheats;
+    const isSplitView =
+      hasDisabledUnits || hasHostCheats || settings.length >= 5;
+    return {
+      c,
+      settings,
+      cheats,
+      hasModifiers,
+      isSplitView,
+    };
+  }
+
+  private isAnimating = false;
+
+  private onSummaryClick = (e: MouseEvent) => {
+    const details = (e.currentTarget as HTMLElement | null)?.closest("details");
+    if (!details || this.isAnimating) {
+      e.preventDefault();
+      return;
+    }
+    if (
+      !details.open ||
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return;
+    }
+    e.preventDefault();
+    this.isAnimating = true;
+    details.classList.add("is-closing");
+  };
+
+  private onTransitionEnd = (e: TransitionEvent) => {
+    if (e.propertyName !== "grid-template-rows") return;
+    const details = (e.currentTarget as HTMLElement).closest("details");
+    if (details?.classList.contains("is-closing")) {
+      details.classList.remove("is-closing");
+      details.open = this.isDesktop;
+    }
+    this.isAnimating = false;
+  };
+
+  private renderMobileSummary(totalCount: number) {
+    return html`
+      <summary
+        @click=${this.onSummaryClick}
+        class="flex items-center justify-between cursor-pointer px-3 py-1 text-xs font-semibold text-slate-400 uppercase tracking-wider select-none hover:text-slate-300 list-none [&::-webkit-details-marker]:hidden sm:hidden"
+      >
+        <div class="flex items-center gap-2">
+          <span>${translateText("user_setting.modifiers")}</span>
+          <span
+            class="rounded-full bg-slate-700 border border-slate-600 px-2 py-0.5 text-[10px] font-bold text-slate-300 tracking-normal"
+          >
+            ${totalCount}
+          </span>
+        </div>
+        <svg
+          class="size-3.5 text-slate-400 transition-transform duration-200 group-open:-rotate-90 group-[.is-closing]:rotate-0 shrink-0"
+          viewBox="0 0 16 16"
+          fill="currentColor"
+          aria-hidden="true"
+        >
+          <path
+            fill-rule="evenodd"
+            d="M9.78 12.78a.75.75 0 0 1-1.06 0L4.47 8.53a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 1.06L6.06 8l3.72 3.72a.75.75 0 0 1 0 1.06Z"
+            clip-rule="evenodd"
+          />
+        </svg>
+      </summary>
+    `;
+  }
+
+  private renderAccordionStyles() {
+    return html`
+      <style>
+        @media (max-width: 639px) {
+          details[data-game-modifiers] > .details-grid-wrapper {
+            display: grid;
+            grid-template-rows: 0fr;
+            transition: grid-template-rows 0.3s ease-out;
+          }
+
+          details[data-game-modifiers][open] > .details-grid-wrapper {
+            grid-template-rows: 1fr;
+          }
+
+          details[data-game-modifiers].is-closing > .details-grid-wrapper {
+            grid-template-rows: 0fr;
+          }
+
+          details[data-game-modifiers]
+            > .details-grid-wrapper
+            > .details-grid-inner {
+            overflow: hidden;
+          }
+        }
+
+        @media (min-width: 640px) {
+          details[data-game-modifiers] > .details-grid-wrapper {
+            display: block;
+          }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          details[data-game-modifiers] > .details-grid-wrapper {
+            transition: none !important;
+          }
+        }
+      </style>
+    `;
+  }
+
+  private renderModifierContent(
+    c: GameConfig,
+    settings: ReturnType<typeof notableLobbySettings>,
+    isPlain: boolean,
+  ) {
+    const standardLabel = translateText("public_lobby.custom_default_settings");
+    return html`
+      <div class="flex flex-col gap-3 ${isPlain ? "" : "pt-2 sm:pt-0"}">
+        <div>
+          <div
+            class="${isPlain ? "" : "hidden sm:block "}px-3 mb-1 text-[10px] font-bold text-slate-400 uppercase tracking-widest"
+          >
+            ${translateText("user_setting.modifiers")}
+          </div>
+          ${
+            settings.length > 0
+              ? html`<div
+                  class="flex flex-wrap gap-1.5 px-3"
+                  data-modifier-tags
+                >
+                  ${settings.map(
+                    (s) =>
+                      html`<span class=${FLAT_SETTING_TAG}
+                        >${lobbySettingTagText(s)}</span
+                      >`,
+                  )}
+                </div>`
+              : html`<div
+                  class="px-3 text-sm text-slate-300 font-normal"
+                  data-standard-settings
+                >
+                  ${standardLabel}
+                </div>`
+          }
+        </div>
+        ${disabledUnitsBox(c, "px-3", "flat")}
+        ${hostCheatsBox(c, "px-3", "flat")}
+      </div>
+    `;
+  }
+
+  private renderModifiers() {
+    const { c, settings, cheats, hasModifiers, isSplitView } =
+      this.getModifierData();
+    if (!hasModifiers || c === null) return null;
+
+    if (!isSplitView) {
+      return html`
+        <div data-game-modifiers>
+          ${this.renderModifierContent(c, settings, true)}
+        </div>
+      `;
+    }
+
+    const totalCount =
+      settings.length + (c.disabledUnits?.length ?? 0) + cheats.length;
+
+    return html`
+      ${this.renderAccordionStyles()}
+      <details class="group" data-game-modifiers ?open=${this.isDesktop}>
+        ${this.renderMobileSummary(totalCount)}
+        <div
+          class="details-grid-wrapper"
+          @transitionend=${this.onTransitionEnd}
+          @transitioncancel=${this.onTransitionEnd}
+        >
+          <div class="details-grid-inner">
+            ${this.renderModifierContent(c, settings, false)}
+          </div>
+        </div>
+      </details>
+    `;
+  }
+
+  private renderGameInfo(isSplitView: boolean) {
+    const badges = this.renderHeaderBadges();
+    const modifiers = this.renderModifiers();
+    if (badges === null && modifiers === null) return null;
+
+    return html`
+      <div
+        class="border-t border-slate-600 pt-3 mt-1 ${
+          isSplitView
+            ? "sm:border-t-0 sm:pt-0 sm:mt-0 sm:col-start-1 sm:row-start-1 sm:row-span-2 sm:border-r sm:border-slate-600 sm:pr-6"
+            : ""
+        } flex flex-col gap-3"
+      >
+        ${badges} ${modifiers}
+      </div>
+    `;
+  }
+
+  private renderTopActions() {
+    return html`
+      ${this.renderSaveRow()}
+
+      <button
+        type="button"
+        data-open-graphics
+        class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
+        @click=${this.onOpenGraphicsButtonClick}
+      >
+        <img src=${settingsIcon} alt="" width="20" height="20" />
+        <span class="font-medium">
+          ${translateText("user_setting.tab_graphics")}
+        </span>
+      </button>
+
+      <button
+        class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
+        data-open-settings
+        @click="${this.onOpenSettingsButtonClick}"
+      >
+        <img src=${settingsIcon} alt="" width="20" height="20" />
+        <div class="flex-1 min-w-0">
+          <div class="font-medium">
+            ${translateText("user_setting.open_settings_label")}
+          </div>
+          <div
+            class="text-sm text-slate-400 whitespace-normal sm:whitespace-nowrap"
+          >
+            ${translateText("user_setting.open_settings_desc")}
+          </div>
+        </div>
+      </button>
+
+      <button
+        class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
+        @click="${this.onTerrainButtonClick}"
+      >
+        <img src=${treeIcon} alt="" width="20" height="20" />
+        <div class="flex-1">
+          <div class="font-medium">
+            ${translateText("user_setting.toggle_terrain")}
+          </div>
+          <div class="text-sm text-slate-400">
+            ${translateText("user_setting.toggle_view_desc")}
+          </div>
+        </div>
+        <div class="text-sm text-slate-400 font-normal">
+          ${
+            this.alternateView
+              ? translateText("user_setting.on")
+              : translateText("user_setting.off")
+          }
+        </div>
+      </button>
+    `;
+  }
+
+  private renderBottomActions() {
+    return html`
+      <div class="border-t border-slate-600 pt-3 mt-1">
+        <div
+          class="px-3 py-1 text-xs font-semibold text-slate-400 uppercase tracking-wider"
+        >
+          ${translateText("user_setting.development_only")}
+        </div>
+
+        <button
+          class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
+          @click="${this.onRenderDebugGuiButtonClick}"
+        >
+          <img src=${settingsIcon} alt="" width="20" height="20" />
+          <div class="flex-1">
+            <div class="font-medium">
+              ${translateText("user_setting.render_debug_gui")}
+            </div>
+            <div class="text-sm text-slate-400">
+              ${translateText("user_setting.render_debug_gui_desc")}
+            </div>
+          </div>
+        </button>
+      </div>
+
+      <div class="border-t border-slate-600 pt-3 mt-1">
+        <button
+          class="flex gap-3 items-center w-full text-left p-3 hover:bg-red-600/20 rounded-sm text-red-400 transition-colors"
+          @click="${this.onExitButtonClick}"
+        >
+          <img src=${exitIcon} alt="" width="20" height="20" />
+          <div class="flex-1">
+            <div class="font-medium">
+              ${translateText("user_setting.exit_game_label")}
+            </div>
+            <div class="text-sm text-slate-400">
+              ${translateText("user_setting.exit_game_info")}
+            </div>
+          </div>
+        </button>
+      </div>
+    `;
   }
 
   render() {
@@ -170,13 +671,17 @@ export class SettingsModal extends LitElement implements Controller {
       return null;
     }
 
+    const { isSplitView } = this.getModifierData();
+
     return html`
       <div
         class="modal-overlay fixed inset-0 bg-black/60 backdrop-blur-xs z-2000 flex items-center justify-center p-4"
         @contextmenu=${(e: Event) => e.preventDefault()}
       >
         <div
-          class="bg-slate-800 border border-slate-600 rounded-lg max-w-md w-full max-h-[80vh] overflow-y-auto"
+          class="bg-slate-800 border border-slate-600 rounded-lg ${
+            isSplitView ? "max-w-md sm:max-w-3xl" : "max-w-md"
+          } w-full max-h-[80vh] overflow-y-auto"
         >
           <div
             class="flex items-center justify-between p-4 border-b border-slate-600"
@@ -194,92 +699,51 @@ export class SettingsModal extends LitElement implements Controller {
               </h2>
             </div>
             <button
-              class="text-slate-400 hover:text-white text-2xl font-bold leading-none"
-              @click=${this.closeModal}
+              class="text-slate-400 hover:text-white text-2xl font-bold leading-none cursor-pointer"
+              @click=${() => this.closeModal()}
             >
               ×
             </button>
           </div>
 
-          <div class="p-4 flex flex-col gap-3">
-            <button
-              class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
-              data-open-settings
-              @click="${this.onOpenSettingsButtonClick}"
+          <div class="p-4">
+            <div
+              class="${
+                isSplitView
+                  ? "grid grid-cols-1 sm:grid-cols-[1fr_360px] gap-3 sm:gap-6"
+                  : "flex flex-col gap-3"
+              }"
             >
-              <img src=${settingsIcon} alt="" width="20" height="20" />
-              <div class="flex-1">
-                <div class="font-medium">
-                  ${translateText("user_setting.open_settings_label")}
-                </div>
-                <div class="text-sm text-slate-400">
-                  ${translateText("user_setting.open_settings_desc")}
-                </div>
-              </div>
-            </button>
-
-            <button
-              class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
-              @click="${this.onTerrainButtonClick}"
-            >
-              <img src=${treeIcon} alt="" width="20" height="20" />
-              <div class="flex-1">
-                <div class="font-medium">
-                  ${translateText("user_setting.toggle_terrain")}
-                </div>
-                <div class="text-sm text-slate-400">
-                  ${translateText("user_setting.toggle_view_desc")}
-                </div>
-              </div>
-              <div class="text-sm text-slate-400">
-                ${this.alternateView
-                  ? translateText("user_setting.on")
-                  : translateText("user_setting.off")}
-              </div>
-            </button>
-
-            <div class="border-t border-slate-600 pt-3 mt-4">
               <div
-                class="px-3 py-1 text-xs font-semibold text-slate-400 uppercase tracking-wider"
+                class="flex flex-col gap-3 ${
+                  isSplitView ? "sm:col-start-2 sm:row-start-1" : ""
+                }"
               >
-                ${translateText("user_setting.development_only")}
+                ${this.renderTopActions()}
               </div>
 
-              <button
-                class="flex gap-3 items-center w-full text-left p-3 hover:bg-slate-700 rounded-sm text-white transition-colors"
-                @click="${this.onRenderDebugGuiButtonClick}"
-              >
-                <img src=${settingsIcon} alt="" width="20" height="20" />
-                <div class="flex-1">
-                  <div class="font-medium">
-                    ${translateText("user_setting.render_debug_gui")}
-                  </div>
-                  <div class="text-sm text-slate-400">
-                    ${translateText("user_setting.render_debug_gui_desc")}
-                  </div>
-                </div>
-              </button>
-            </div>
+              ${this.renderGameInfo(isSplitView)}
 
-            <div class="border-t border-slate-600 pt-3 mt-4">
-              <button
-                class="flex gap-3 items-center w-full text-left p-3 hover:bg-red-600/20 rounded-sm text-red-400 transition-colors"
-                @click="${this.onExitButtonClick}"
+              <div
+                class="flex flex-col gap-3 ${
+                  isSplitView ? "sm:col-start-2 sm:row-start-2" : ""
+                }"
               >
-                <img src=${exitIcon} alt="" width="20" height="20" />
-                <div class="flex-1">
-                  <div class="font-medium">
-                    ${translateText("user_setting.exit_game_label")}
-                  </div>
-                  <div class="text-sm text-slate-400">
-                    ${translateText("user_setting.exit_game_info")}
-                  </div>
-                </div>
-              </button>
+                ${this.renderBottomActions()}
+              </div>
             </div>
           </div>
         </div>
       </div>
     `;
   }
+}
+
+/** "World 2026-10-19 14:05": the map and the local time, editable later. */
+export function defaultSaveName(mapName: string, at: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const date = `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+  const time = `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+  // The API caps names at 64 characters.
+  return `${mapName.slice(0, 47)} ${date} ${time}`;
 }
